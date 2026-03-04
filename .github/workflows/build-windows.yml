@@ -22,10 +22,25 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
+
+      - name: Tool versions
+        run: |
+          node --version
+          npm --version
+          bun --version
 
       - name: Build Windows package
+        shell: pwsh
         run: npm run package:win
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/cognautic-forge-windows.zip")) {
+            throw "Expected dist/cognautic-forge-windows.zip was not generated."
+          }
+          Get-Item "dist/cognautic-forge-windows.zip" | Format-List Name,Length,LastWriteTime
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
