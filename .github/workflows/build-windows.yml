@@ -52,8 +52,27 @@ jobs:
           name: cognautic-forge-windows
           path: dist/cognautic-forge-windows.zip
 
+      - name: Resolve release tag
+        id: resolve_tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.eventName === "release") {
+              const tag = context.payload.release?.tag_name;
+              if (!tag) core.setFailed("Release event missing tag_name");
+              core.setOutput("tag", tag);
+              return;
+            }
+            const { data } = await github.rest.repos.getLatestRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            if (!data?.tag_name) core.setFailed("No latest release tag found");
+            core.setOutput("tag", data.tag_name);
+
       - name: Upload to GitHub Release
-        if: github.event_name == 'release'
+        if: steps.resolve_tag.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.resolve_tag.outputs.tag }}
           files: dist/cognautic-forge-windows.zip
