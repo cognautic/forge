@@ -30,9 +30,13 @@ jobs:
           npm --version
           bun --version
 
-      - name: Build Windows package
+      - name: Build Windows binary
         shell: pwsh
-        run: npm run package:win
+        run: bun build --compile src/main.ts --external electron --outfile dist/forge.exe
+
+      - name: Package Windows zip
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 
       - name: Verify output
         shell: pwsh
