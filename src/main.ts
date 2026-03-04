@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 import { parseArgv } from "./cli/core/args";
 import { HELP } from "./cli/core/help";
 import { loadState, saveState } from "./cli/core/state";

@@ -1,5 +1,5 @@
 export const HELP = `
-Cognautic Forge (Bun CLI)
+Cognautic Forge (Node CLI)
 
 Interactive Mode:
   forge

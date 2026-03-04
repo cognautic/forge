@@ -1,4 +1,4 @@
-# Cognautic Forge (Bun CLI Co-Worker)
+# Cognautic Forge (Node CLI Co-Worker)
 
 Cognautic Forge is a local-first, interactive Bun CLI agent with:
 
@@ -9,7 +9,22 @@ Cognautic Forge is a local-first, interactive Bun CLI agent with:
 - System control tools (mouse/keyboard/screenshot/OCR)
 - Persistent collaborative workspace (objective, tasks, artifacts, timeline, roles)
 
-## Run
+## Install (npm)
+
+Global install:
+
+```bash
+npm i -g cognautic-forge
+forge
+```
+
+Run without global install:
+
+```bash
+npx cognautic-forge
+```
+
+## Local Development
 
 ```bash
 bun install
@@ -17,6 +32,29 @@ bun run src/main.ts
 ```
 
 This starts interactive mode.
+
+## Build npm Package
+
+```bash
+npm run build:npm
+npm pack
+```
+
+This generates `dist/main.js` and an npm tarball for publishing/install testing.
+
+## Publish to npm
+
+```bash
+npm login
+npm publish --access public
+```
+
+After publish, users can install directly:
+
+```bash
+npm i -g cognautic-forge
+forge
+```
 
 ## Build Installable Packages
 
@@ -40,7 +78,7 @@ Generated artifacts:
 - `dist/cognautic-forge-macos.tar.gz`
 - `dist/cognautic-forge-windows.zip`
 
-Install directly from latest GitHub release:
+Install directly from latest GitHub release (binary channel):
 
 Linux:
 
@@ -198,29 +236,29 @@ Finalization:
 State / provider:
 
 ```bash
-bun run src/main.ts state show
-bun run src/main.ts state set-root /path/to/project
-bun run src/main.ts state set-browser /usr/sbin/brave
-bun run src/main.ts provider show
-bun run src/main.ts provider set openai gpt-4.1-mini
-bun run src/main.ts provider key set openai sk-...
-bun run src/main.ts provider models openai
+forge state show
+forge state set-root /path/to/project
+forge state set-browser /usr/sbin/brave
+forge provider show
+forge provider set openai gpt-4.1-mini
+forge provider key set openai sk-...
+forge provider models openai
 ```
 
 Chat:
 
 ```bash
-bun run src/main.ts chat "summarize this repository"
+forge chat "summarize this repository"
 ```
 
 Workspace:
 
 ```bash
-bun run src/main.ts workspace show
-bun run src/main.ts workspace objective "Ship feature X with tests"
-bun run src/main.ts workspace task add "Draft implementation plan"
-bun run src/main.ts workspace task list
-bun run src/main.ts workspace task set <taskId> approved
+forge workspace show
+forge workspace objective "Ship feature X with tests"
+forge workspace task add "Draft implementation plan"
+forge workspace task list
+forge workspace task set <taskId> approved
 ```
 
 ## Notes

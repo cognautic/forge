@@ -1,4 +1,4 @@
-import readline from "node:readline";
+import * as readline from "node:readline";
 import type { CoworkRole, ForgeState, ProviderKind, TaskStatus } from "../types";
 import { saveState } from "../core/state";
 import { PROVIDERS, fetchModels, setApiKeyInConfig, setProvider } from "../providers/manager";

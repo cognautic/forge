@@ -1,12 +1,23 @@
 {
   "name": "cognautic-forge",
   "version": "0.0.1",
-  "private": true,
-  "type": "module",
+  "private": false,
+  "type": "commonjs",
+  "description": "Cognautic Forge - local-first AI co-worker CLI",
+  "license": "UNLICENSED",
+  "main": "dist/main.js",
   "bin": {
-    "forge": "./src/main.ts"
+    "forge": "./dist/main.js"
   },
+  "files": [
+    "dist/**/*.js",
+    "README.md",
+    "LICENSE*"
+  ],
   "scripts": {
+    "build": "npm run build:npm",
+    "build:npm": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build:npm",
     "dev": "bun run src/main.ts",
     "check": "bunx tsc --noEmit",
     "start": "bun run src/main.ts",
