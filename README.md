@@ -51,48 +51,6 @@ npm pack
 This generates `dist/main.js` and an npm tarball for publishing/install testing.
 Do not use `bun build --compile` for Forge distribution because runtime modules like Playwright must remain external npm dependencies.
 
-## Build Installable Packages
-
-Forge can be packaged into installable CLI bundles for Linux, macOS, and Windows.
-
-```bash
-npm run package:linux
-npm run package:mac
-npm run package:win
-```
-
-Or build everything available on your current machine:
-
-```bash
-npm run package:all
-```
-
-Generated artifacts:
-
-- `dist/cognautic-forge-linux.tar.gz`
-- `dist/cognautic-forge-macos.tar.gz`
-- `dist/cognautic-forge-windows.zip`
-
-Install directly from latest GitHub release (binary channel):
-
-Linux:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/cognautic/forge/main/scripts/install-linux.sh | bash
-```
-
-macOS:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/cognautic/forge/main/scripts/install-macos.sh | bash
-```
-
-Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/cognautic/forge/main/scripts/install-windows.ps1 -UseBasicParsing | iex"
-```
-
 ## Provider Support
 
 - OpenAI

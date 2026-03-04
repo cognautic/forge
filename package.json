@@ -20,13 +20,7 @@
     "prepare": "npm run build:npm",
     "dev": "bun run src/main.ts",
     "check": "bunx tsc --noEmit",
-    "start": "bun run src/main.ts",
-    "build:binary": "bun build --compile src/main.ts --external electron --outfile dist/forge",
-    "build:binary:win": "bun build --compile src/main.ts --external electron --outfile dist/forge.exe",
-    "package:linux": "npm run build:binary && mkdir -p dist/release && cp dist/forge dist/release/forge && cp scripts/install-linux.sh dist/release/install.sh && chmod +x dist/release/forge dist/release/install.sh && tar -czf dist/cognautic-forge-linux.tar.gz -C dist/release forge install.sh",
-    "package:mac": "npm run build:binary && mkdir -p dist/release && cp dist/forge dist/release/forge && cp scripts/install-macos.sh dist/release/install.sh && chmod +x dist/release/forge dist/release/install.sh && tar -czf dist/cognautic-forge-macos.tar.gz -C dist/release forge install.sh",
-    "package:win": "npm run build:binary:win && powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1",
-    "package:all": "npm run package:linux && npm run package:mac && (command -v powershell >/dev/null 2>&1 && npm run package:win || echo 'Skipping package:win (powershell not found)')"
+    "start": "bun run src/main.ts"
   },
   "dependencies": {
     "chromium-bidi": "^15.0.0",
