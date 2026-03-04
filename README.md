@@ -1,6 +1,6 @@
 # Cognautic Forge (Node CLI Co-Worker)
 
-Cognautic Forge is a local-first, interactive Bun CLI agent with:
+Cognautic Forge is a local-first, interactive Node CLI agent with:
 
 - Multi-provider LLM support (user API keys)
 - Tool-calling agent loop with auto-followup
@@ -33,6 +33,14 @@ bun run src/main.ts
 
 This starts interactive mode.
 
+Node path (no Bun runtime required):
+
+```bash
+npm install
+npm run build:npm
+node dist/main.js
+```
+
 ## Build npm Package
 
 ```bash
@@ -41,20 +49,7 @@ npm pack
 ```
 
 This generates `dist/main.js` and an npm tarball for publishing/install testing.
-
-## Publish to npm
-
-```bash
-npm login
-npm publish --access public
-```
-
-After publish, users can install directly:
-
-```bash
-npm i -g cognautic-forge
-forge
-```
+Do not use `bun build --compile` for Forge distribution because runtime modules like Playwright must remain external npm dependencies.
 
 ## Build Installable Packages
 
