@@ -1,5 +1,5 @@
 {
-  "name": "@cognautic.space/forge",
+  "name": "cognautic-forge",
   "version": "0.0.1",
   "private": false,
   "type": "commonjs",
