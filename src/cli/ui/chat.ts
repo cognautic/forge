@@ -1,5 +1,4 @@
 import * as readline from "node:readline";
-import { Writable } from "node:stream";
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
@@ -82,22 +81,9 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   let shellMode = false;
   const promptPrefix = () => (shellMode ? "sh> " : "you> ");
 
-  let suppressReadlineEcho = false;
-  const rlOutput = new Writable({
-    write(chunk, encoding, callback) {
-      if (!suppressReadlineEcho) {
-        process.stdout.write(chunk as Buffer | string, encoding as BufferEncoding);
-      }
-      callback();
-    }
-  });
-  (rlOutput as NodeJS.WriteStream).isTTY = Boolean(process.stdout.isTTY);
-  (rlOutput as NodeJS.WriteStream).columns = process.stdout.columns;
-  (rlOutput as NodeJS.WriteStream).rows = process.stdout.rows;
-
   const rl = readline.createInterface({
     input: process.stdin,
-    output: rlOutput as unknown as NodeJS.WriteStream,
+    output: process.stdout,
     historySize: 300,
     completer: (line: string) => completeLine(line, ctx)
   });
