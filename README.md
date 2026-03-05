@@ -14,14 +14,14 @@ Cognautic Forge is a local-first, interactive Node CLI agent with:
 Global install:
 
 ```bash
-npm i -g cognautic-forge-cli
+npm i -g @cognautic.space/forge
 forge
 ```
 
 Run without global install:
 
 ```bash
-npx cognautic-forge-cli
+npx @cognautic.space/forge
 ```
 
 ## Local Development
