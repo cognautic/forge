@@ -85,7 +85,7 @@ Provider / model:
 - `/apikey <provider> <key>`
 - `/endpoint <url>` (custom / ollama endpoint)
 
-Permissions / environment:
+Runtime / environment:
 
 - `/mode <safe|yolo>`
 - `/yolo [on|off|toggle]` (shortcut: `Ctrl+Y`)

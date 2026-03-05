@@ -19,7 +19,6 @@ import {
 } from "../browser/playwright";
 import { readWorkspaceFile, writeWorkspaceFile } from "../core/filesystem";
 import { runCommand, runCommandDirect } from "../terminal/exec";
-import { assertPermission } from "../core/permissions";
 import { systemKeyboardType, systemMouseClick, systemMouseMove, systemOcr, systemScreenshot } from "../system/control";
 
 type ToolCall = { type: "tool"; tool: string; args?: Record<string, unknown> };
@@ -138,7 +137,6 @@ export async function runAiTurn(
     "- If command missing, try alternative tools/commands and report what worked.",
     `Search intent for this user message: ${searchIntent ? "yes" : "no"}`,
     `System info: ${JSON.stringify(osInfo)}`,
-    `Permissions: ${JSON.stringify(state.permissions)}`,
     "Workspace snapshot:",
     workspaceContext,
     "Memory snapshot:",
@@ -209,13 +207,11 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   const args = call.args || {};
 
   if (call.tool === "browser.launch") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     return "browser launched";
   }
 
   if (call.tool === "browser.goto") {
-    assertPermission(state, "browser");
     const url = String(args.url || "https://example.com");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     await navigate(url);
@@ -223,7 +219,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "browser.search") {
-    assertPermission(state, "browser");
     const query = String(args.query || "");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     if ((state.searchMode || "safe") === "manual") {
@@ -240,7 +235,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "browser.read_dom") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     const chk = await detectBotChallenge();
     if (chk.challenged) {
@@ -251,7 +245,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "browser.scroll") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     const pixels = Number(args.pixels || 1200);
     await scrollPage(pixels);
@@ -259,14 +252,12 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "browser.extract") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     const selector = String(args.selector || "body");
     return await extract(selector);
   }
 
   if (call.tool === "browser.click") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     const selector = String(args.selector || "a");
     await click(selector);
@@ -274,7 +265,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "browser.eval") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     const script = String(args.script || "document.title");
     const out = await evaluate(script);
@@ -282,21 +272,18 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "browser.overlay_on") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     await setVisualOverlay(true);
     return "overlay enabled";
   }
 
   if (call.tool === "browser.overlay_off") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     await setVisualOverlay(false);
     return "overlay disabled";
   }
 
   if (call.tool === "browser.cursor_move") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     const x = Number(args.x ?? 120);
     const y = Number(args.y ?? 120);
@@ -305,7 +292,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "browser.cursor_click") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     const button = String(args.button || "left") as "left" | "right" | "middle";
     await clickAiCursor(button);
@@ -313,7 +299,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "browser.cursor_type") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     const text = String(args.text || "");
     await typeAtCursor(text);
@@ -321,53 +306,45 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "browser.cursor_show") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     await setAiCursorVisible(true);
     return "browser ai cursor shown";
   }
 
   if (call.tool === "browser.cursor_hide") {
-    assertPermission(state, "browser");
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     await setAiCursorVisible(false);
     return "browser ai cursor hidden";
   }
 
   if (call.tool === "system.mouse_move") {
-    assertPermission(state, "input");
     const x = Number(args.x ?? 100);
     const y = Number(args.y ?? 100);
     return await systemMouseMove(x, y);
   }
 
   if (call.tool === "system.mouse_click") {
-    assertPermission(state, "input");
     const button = String(args.button || "left") as "left" | "right" | "middle";
     return await systemMouseClick(button);
   }
 
   if (call.tool === "system.keyboard_type") {
-    assertPermission(state, "input");
     const text = String(args.text || "");
     return await systemKeyboardType(text);
   }
 
   if (call.tool === "system.screen_capture") {
-    assertPermission(state, "input");
     const path = await systemScreenshot(".forge-data/screens");
     return `screenshot saved: ${path}`;
   }
 
   if (call.tool === "system.screen_ocr") {
-    assertPermission(state, "input");
     const imagePath = String(args.image_path || "");
     if (!imagePath) return "missing image_path";
     return await systemOcr(imagePath);
   }
 
   if (call.tool === "system.exec") {
-    assertPermission(state, "command");
     const command = String(args.command || "");
     if (!command) return "missing command";
     const blocked = blockedCommandMessage(commandProgram(command));
@@ -377,7 +354,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "command.run") {
-    assertPermission(state, "command");
     const command = String(args.command || "");
     if (!command) return "missing command";
     const blocked = blockedCommandMessage(commandProgram(command));
@@ -387,7 +363,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "files.read") {
-    assertPermission(state, "read");
     const path = String(args.path || "");
     try {
       const data = await readWorkspaceFile(state.projectRoot, path);
@@ -398,7 +373,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "files.write") {
-    assertPermission(state, "write");
     const path = String(args.path || "");
     const content = String(args.content || "");
     try {
@@ -410,7 +384,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "exec.run") {
-    assertPermission(state, "command");
     const command = String(args.command || "echo missing command");
     const blocked = blockedCommandMessage(commandProgram(command));
     if (blocked) return blocked;
@@ -419,7 +392,6 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   if (call.tool === "exec.direct") {
-    assertPermission(state, "command");
     const program = String(args.program || "");
     const argv = Array.isArray(args.args) ? args.args.map((x) => String(x)) : [];
     if (!program) return "missing program";

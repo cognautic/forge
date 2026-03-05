@@ -221,7 +221,7 @@ function detectIntent(user: string): string {
   if (/\b(write|create|edit|change|fix|refactor)\b/.test(u)) return "code_change";
   if (/\b(run|execute|command|terminal)\b/.test(u)) return "command_execution";
   if (/\b(browser|open|navigate|click|scroll)\b/.test(u)) return "browser_automation";
-  if (/\b(config|provider|model|apikey|permission|perm)\b/.test(u)) return "configuration";
+  if (/\b(config|provider|model|apikey)\b/.test(u)) return "configuration";
   return "general";
 }
 

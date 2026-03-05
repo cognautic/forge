@@ -2,8 +2,7 @@
 import { parseArgv } from "./cli/core/args";
 import { HELP } from "./cli/core/help";
 import { loadState, saveState } from "./cli/core/state";
-import { setPermission, assertPermission } from "./cli/core/permissions";
-import type { PermissionTier, ProviderKind } from "./cli/types";
+import type { ProviderKind } from "./cli/types";
 import { fetchModels, setApiKeyInConfig, setProvider } from "./cli/providers/manager";
 import { listFiles, readWorkspaceFile, writeWorkspaceFile } from "./cli/core/filesystem";
 import { runCommand } from "./cli/terminal/exec";
@@ -73,21 +72,6 @@ async function main() {
     return;
   }
 
-  if (parsed.command === "permissions" && parsed.subcommand === "show") {
-    print(state.permissions);
-    return;
-  }
-
-  if (parsed.command === "permissions" && parsed.subcommand === "set") {
-    const tier = parsed.rest[0] as PermissionTier | undefined;
-    const value = parsed.rest[1];
-    if (!tier || !["read", "write", "command", "browser", "input"].includes(tier)) throw new Error("Invalid tier");
-    state = setPermission(state, tier, value === "on");
-    await saveState(state);
-    print(state.permissions);
-    return;
-  }
-
   if (parsed.command === "provider" && parsed.subcommand === "show") {
     print(state.provider);
     return;
@@ -121,14 +105,12 @@ async function main() {
   }
 
   if (parsed.command === "files" && parsed.subcommand === "list") {
-    assertPermission(state, "read");
     const limit = Number(parsed.flags.limit ?? 200);
     print(await listFiles(state.projectRoot, limit));
     return;
   }
 
   if (parsed.command === "files" && parsed.subcommand === "read") {
-    assertPermission(state, "read");
     const path = parsed.rest[0];
     if (!path) throw new Error("Missing path");
     print(await readWorkspaceFile(state.projectRoot, path));
@@ -136,7 +118,6 @@ async function main() {
   }
 
   if (parsed.command === "files" && parsed.subcommand === "write") {
-    assertPermission(state, "write");
     const [path, ...contentParts] = parsed.rest;
     if (!path) throw new Error("Missing path");
     await writeWorkspaceFile(state.projectRoot, path, contentParts.join(" "));
@@ -145,7 +126,6 @@ async function main() {
   }
 
   if (parsed.command === "exec" && parsed.subcommand === "run") {
-    assertPermission(state, "command");
     const cmd = parsed.rest.join(" ");
     if (!cmd) throw new Error("Missing command");
     const result = await runCommand(cmd, state.projectRoot);
@@ -154,7 +134,6 @@ async function main() {
   }
 
   if (parsed.command === "browser" && parsed.subcommand === "launch") {
-    assertPermission(state, "browser");
     await launchBrowser(
       (parsed.flags.dir as string) || ".forge-data/browser",
       (parsed.flags.executable as string) || state.browserExecutablePath
@@ -164,33 +143,28 @@ async function main() {
   }
 
   if (parsed.command === "browser" && parsed.subcommand === "goto") {
-    assertPermission(state, "browser");
     await navigate(parsed.rest[0] || "https://example.com");
     print("ok");
     return;
   }
 
   if (parsed.command === "browser" && parsed.subcommand === "click") {
-    assertPermission(state, "browser");
     await click(parsed.rest[0] || "body");
     print("ok");
     return;
   }
 
   if (parsed.command === "browser" && parsed.subcommand === "extract") {
-    assertPermission(state, "browser");
     print(await extract(parsed.rest[0] || "body"));
     return;
   }
 
   if (parsed.command === "browser" && parsed.subcommand === "eval") {
-    assertPermission(state, "browser");
     print(await evaluate(parsed.rest.join(" ") || "document.title"));
     return;
   }
 
   if (parsed.command === "input") {
-    assertPermission(state, "input");
     if (parsed.subcommand === "move") return print(moveMouse(Number(parsed.rest[0]), Number(parsed.rest[1])));
     if (parsed.subcommand === "click") return print(clickMouse((parsed.rest[0] as "left" | "right" | "middle") || "left"));
     if (parsed.subcommand === "type") return print(typeText(parsed.rest.join(" ")));

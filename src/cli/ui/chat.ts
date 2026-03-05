@@ -930,7 +930,6 @@ function printStatus(state: ForgeState, modelCount: number): void {
     autoContinueMax: state.autoContinueMax ?? 20,
     browserExecutablePath: state.browserExecutablePath || null,
     projectRoot: state.projectRoot,
-    permissions: state.permissions,
     modelSuggestions: modelCount
   }, null, 2));
 }

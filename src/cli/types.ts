@@ -1,5 +1,3 @@
-export type PermissionTier = "read" | "write" | "command" | "browser" | "input";
-
 export type ProviderKind =
   | "openai"
   | "google"
@@ -35,7 +33,6 @@ export interface ForgeState {
   onboardingComplete: boolean;
   browserExecutablePath?: string;
   searchMode?: "safe" | "manual";
-  permissions: Record<PermissionTier, boolean>;
   provider: ProviderConfig;
   apiKeys: Partial<Record<ProviderKind, string>>;
 }

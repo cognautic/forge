@@ -34,8 +34,6 @@ CLI Commands:
   forge state show
   forge state set-root <path>
   forge state set-browser </usr/sbin/brave>
-  forge permissions show
-  forge permissions set <tier> <on|off>
   forge provider show
   forge provider set <provider> <model> [--endpoint URL]
   forge provider key set <provider> <api-key>

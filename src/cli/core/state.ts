@@ -10,13 +10,6 @@ const defaultState: ForgeState = {
   executionMode: "safe",
   onboardingComplete: false,
   searchMode: "safe",
-  permissions: {
-    read: true,
-    write: false,
-    command: false,
-    browser: false,
-    input: false
-  },
   provider: {
     provider: "openai",
     model: "gpt-4.1-mini"
@@ -39,10 +32,6 @@ export async function loadState(): Promise<ForgeState> {
           ? Math.min(120, Math.max(1, Math.floor(parsed.autoContinueMax)))
           : 20,
       searchMode: parsed.searchMode === "manual" ? "manual" : "safe",
-      permissions: {
-        ...defaultState.permissions,
-        ...(parsed.permissions || {})
-      },
       provider: {
         ...defaultState.provider,
         ...(parsed.provider || {})
