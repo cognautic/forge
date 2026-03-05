@@ -31,6 +31,8 @@ Slash Commands in Chat:
   /rename <chat-name>
 
 CLI Commands:
+  forge --reset
+  forge reset
   forge state show
   forge state set-root <path>
   forge state set-browser </usr/sbin/brave>

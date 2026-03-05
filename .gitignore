@@ -1,6 +1,7 @@
 node_modules/
 bun.lockb
-
+test/
+codex/
 # Build outputs
 dist/
 build/

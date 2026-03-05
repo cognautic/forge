@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { ForgeState } from "../types";
@@ -18,6 +18,7 @@ const defaultState: ForgeState = {
 };
 
 export const statePath = join(homedir(), ".config", "cognautic-forge", "state.json");
+export const configDir = dirname(statePath);
 
 export async function loadState(): Promise<ForgeState> {
   try {
@@ -49,4 +50,8 @@ export async function loadState(): Promise<ForgeState> {
 export async function saveState(state: ForgeState): Promise<void> {
   await mkdir(dirname(statePath), { recursive: true });
   await writeFile(statePath, JSON.stringify(state, null, 2), "utf-8");
+}
+
+export async function resetForgeState(): Promise<void> {
+  await rm(configDir, { recursive: true, force: true });
 }

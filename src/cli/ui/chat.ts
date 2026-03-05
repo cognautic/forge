@@ -1,4 +1,8 @@
 import * as readline from "node:readline";
+import { Writable } from "node:stream";
+import { spawn } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import type { CoworkRole, ForgeState, ProviderKind, TaskStatus } from "../types";
 import { saveState } from "../core/state";
 import { PROVIDERS, fetchModels, setApiKeyInConfig, setProvider } from "../providers/manager";
@@ -8,15 +12,12 @@ import {
   addArtifact,
   addTask,
   loadWorkspace,
-  memoryDigest,
-  rememberTurn,
   saveWorkspace,
   setObjective,
   setRoleOwner,
   setTaskStatus,
-  workspaceDigest
 } from "../core/cowork";
-import { appendTurn, ChatSession, createChat, renameChat, resolveChat } from "../core/chats";
+import { appendTurn, ChatSession, ChatTurn, createChat, renameChat, resolveChat } from "../core/chats";
 import { upsertChat } from "../core/chats";
 
 const USE_ANSI = Boolean(process.stdout.isTTY);
@@ -37,7 +38,11 @@ interface ChatContext {
   modelSuggestions: string[];
   workspace: Awaited<ReturnType<typeof loadWorkspace>>;
   chat: ChatSession;
+  sessionMemory: ChatTurn[];
 }
+
+type PasteMode = "idle" | "receiving_paste" | "staged_multiline";
+type PendingAttachment = { token: string; kind: "text" | "image"; text: string; mime?: string; bytes?: number };
 
 const COMMANDS = [
   "/help",
@@ -70,18 +75,77 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   const workspace = await loadWorkspace(initialState.projectRoot);
   const resumed = opts?.resume ? await resolveChat(opts.resume) : null;
   const chat = resumed || (await createChat());
-  const ctx: ChatContext = { state: initialState, modelSuggestions: [], workspace, chat };
+  const ctx: ChatContext = { state: initialState, modelSuggestions: [], workspace, chat, sessionMemory: [...chat.turns] };
   let activeTurnAbort: AbortController | null = null;
   let activeSpinner: { stop: () => void } | null = null;
   let chatDirty = false;
   let shellMode = false;
   const promptPrefix = () => (shellMode ? "sh> " : "you> ");
 
+  let suppressReadlineEcho = false;
+  const rlOutput = new Writable({
+    write(chunk, encoding, callback) {
+      if (!suppressReadlineEcho) {
+        process.stdout.write(chunk as Buffer | string, encoding as BufferEncoding);
+      }
+      callback();
+    }
+  });
+  (rlOutput as NodeJS.WriteStream).isTTY = Boolean(process.stdout.isTTY);
+  (rlOutput as NodeJS.WriteStream).columns = process.stdout.columns;
+  (rlOutput as NodeJS.WriteStream).rows = process.stdout.rows;
+
   const rl = readline.createInterface({
     input: process.stdin,
-    output: process.stdout,
+    output: rlOutput as unknown as NodeJS.WriteStream,
     historySize: 300,
     completer: (line: string) => completeLine(line, ctx)
+  });
+  const pasteState: { mode: PasteMode } = { mode: "idle" };
+  let suppressQueuedPasteLines = 0;
+  let pendingTextPasteToken: string | null = null;
+  let pendingAttachments: PendingAttachment[] = [];
+  let pendingImagePastes: Array<{ path: string; mime: string; bytes: number }> = [];
+  let imagePasteBusy = false;
+  const onImagePasteKey = async (_str: string, key: { name?: string; ctrl?: boolean }) => {
+    if (!key?.ctrl || key.name !== "v") return;
+    if (imagePasteBusy || !process.stdin.isTTY) return;
+    imagePasteBusy = true;
+    try {
+      const pasted = await pasteImageFromClipboard(ctx.state.projectRoot);
+      if (!pasted) return;
+      pendingImagePastes.push(pasted);
+      const token = `[pasted image ${basename(pasted.path)}]`;
+      pendingAttachments.push({ token, kind: "image", text: pasted.path, mime: pasted.mime, bytes: pasted.bytes });
+      insertPlaceholderToken(rl, token, promptPrefix());
+      redrawPrompt(rl, promptPrefix());
+    } finally {
+      imagePasteBusy = false;
+    }
+  };
+  readline.emitKeypressEvents(process.stdin);
+  process.stdin.on("keypress", onImagePasteKey);
+  const stopPasteIndicator = enablePasteIndicator(({ phase, chars, text, multiline, echoedRows, lineCount }) => {
+    if (phase === "receiving_paste") {
+      if (pasteState.mode === "idle") pasteState.mode = "receiving_paste";
+      return;
+    }
+    if (typeof chars !== "number" || typeof text !== "string") {
+      if (pasteState.mode === "receiving_paste") pasteState.mode = "idle";
+      return;
+    }
+
+    if (!multiline) {
+      pasteState.mode = "idle";
+      return;
+    }
+
+    const token = `[pasted ${chars} chars]`;
+    pendingAttachments.push({ token, kind: "text", text });
+    insertPlaceholderToken(rl, token, promptPrefix());
+    pasteState.mode = "idle";
+    // Readline may emit one line callback per pasted line plus a trailing empty submit.
+    suppressQueuedPasteLines = Math.max(0, (lineCount ?? 0) + 1);
   });
   const stopLiveSuggestions = enableLiveSuggestions(rl, ctx, promptPrefix);
   const stopEscAbort = enableEscAbort(() => {
@@ -104,6 +168,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     process.stdout.write(`\ninput-mode=${shellMode ? "shell" : "chat"} (toggled via Shift+Tab)\n`);
     redrawPrompt(rl, promptPrefix());
   });
+  const stopPageUpHistory = enablePageUpHistory(rl);
   const autosaveTimer = setInterval(async () => {
     if (!chatDirty) return;
     try {
@@ -132,19 +197,38 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
 
   if (!ctx.state.onboardingComplete) {
     await runConfigWizard(rl, ctx);
+  } else {
+    await autoRefreshModels(ctx);
   }
 
-  await autoRefreshModels(ctx);
-
   while (true) {
-    const line = await question(rl, promptPrefix());
-    const input = line.trim();
-    if (!input) continue;
+    if (suppressQueuedPasteLines > 0) {
+      await question(rl, "");
+      suppressQueuedPasteLines--;
+      if (suppressQueuedPasteLines === 0) {
+        if (pendingTextPasteToken) {
+          insertPlaceholderToken(rl, pendingTextPasteToken, promptPrefix());
+          pendingTextPasteToken = null;
+        }
+      }
+      redrawPrompt(rl, promptPrefix());
+      continue;
+    }
 
+    const source = await question(rl, promptPrefix());
+    pendingAttachments = pendingAttachments.filter((att) => source.includes(att.token));
+    const input = source
+      .replace(/\[pasted [^\]]+\]/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!input) continue;
+    if (await processInput(input)) break;
+  }
+
+  async function processInput(input: string): Promise<boolean> {
     if (input.startsWith("/")) {
       const shouldExit = await handleSlash(input, ctx, rl);
-      if (shouldExit) break;
-      continue;
+      return shouldExit;
     }
 
     if (shellMode) {
@@ -155,13 +239,28 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       } catch (err) {
         console.error(`error> ${err instanceof Error ? err.message : String(err)}`);
       }
-      continue;
+      return false;
     }
+
+    const textAttachments = pendingAttachments.filter((a) => a.kind === "text");
+    const imageAttachments = pendingAttachments.filter((a) => a.kind === "image");
+    const finalInput = [
+      input,
+      textAttachments.length
+        ? `\nPasted text blocks:\n${textAttachments.map((a, i) => `--- block ${i + 1} ---\n${a.text}`).join("\n")}`
+        : "",
+      imageAttachments.length
+        ? `\nAttached images:\n${imageAttachments.map((a) => `- ${a.text} (${a.mime || "image/*"}, ${a.bytes || 0} bytes)`).join("\n")}`
+        : ""
+    ].filter(Boolean).join("\n\n");
+    pendingImagePastes = [];
+    pendingAttachments = [];
 
     try {
       // Save user message immediately so it survives long-running/aborted turns.
-      await appendTurn(ctx.chat.id, "user", input);
-      ctx.chat.turns.push({ ts: new Date().toISOString(), role: "user", content: input });
+      await appendTurn(ctx.chat.id, "user", finalInput);
+      ctx.chat.turns.push({ ts: new Date().toISOString(), role: "user", content: finalInput });
+      ctx.sessionMemory.push({ ts: new Date().toISOString(), role: "user", content: finalInput });
       ctx.chat.updatedAt = new Date().toISOString();
       chatDirty = true;
 
@@ -171,10 +270,10 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       spinner.start();
       let printedToolBlock = false;
       try {
-        const response = await runAiTurn(ctx.state, input, {
+        const response = await runAiTurn(ctx.state, finalInput, {
           signal: activeTurnAbort.signal,
-          workspaceContext: workspaceDigest(ctx.workspace),
-          memoryContext: memoryDigest(ctx.workspace),
+          workspaceContext: "Session-only mode: no global workspace context.",
+          memoryContext: sessionMemoryDigest(ctx.sessionMemory),
           confirmAction: async (tool, args) => {
             if ((ctx.state.executionMode || "safe") === "yolo") return true;
             spinner.pause();
@@ -206,10 +305,9 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
         process.stdout.write(`${C.green}ai>${C.reset} ${C.white}${response}${C.reset}\n`);
         await appendTurn(ctx.chat.id, "assistant", response);
         ctx.chat.turns.push({ ts: new Date().toISOString(), role: "assistant", content: response });
+        ctx.sessionMemory.push({ ts: new Date().toISOString(), role: "assistant", content: response });
         ctx.chat.updatedAt = new Date().toISOString();
         chatDirty = true;
-        ctx.workspace = rememberTurn(ctx.workspace, input, response);
-        await saveWorkspace(ctx.workspace);
       } finally {
         spinner.stop();
         activeSpinner = null;
@@ -219,13 +317,17 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     } finally {
       activeTurnAbort = null;
     }
+    return false;
   }
 
   rl.close();
   stopLiveSuggestions();
+  stopPasteIndicator();
+  process.stdin.off("keypress", onImagePasteKey);
   stopEscAbort();
   stopCtrlYToggle();
   stopShiftTabToggle();
+  stopPageUpHistory();
   clearInterval(autosaveTimer);
   if (chatDirty) {
     try {
@@ -344,9 +446,7 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
           tasks: ctx.workspace.tasks.length,
           artifacts: ctx.workspace.artifacts.length,
           history: ctx.workspace.history.length,
-          memorySummary: ctx.workspace.memory.summary || null,
-          lastIntent: ctx.workspace.memory.lastIntent || null,
-          recentMemoryTurns: ctx.workspace.memory.recentTurns.length
+          sessionTurns: ctx.sessionMemory.length
         },
         null,
         2
@@ -676,19 +776,11 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
   if (cmd === "/memory") {
     const sub = args[0];
     if (!sub || sub === "show") {
-      console.log(memoryDigest(ctx.workspace));
+      console.log(sessionMemoryDigest(ctx.sessionMemory));
       return false;
     }
     if (sub === "clear") {
-      ctx.workspace = {
-        ...ctx.workspace,
-        memory: {
-          summary: "",
-          lastIntent: "",
-          recentTurns: []
-        }
-      };
-      await saveWorkspace(ctx.workspace);
+      ctx.sessionMemory = [];
       console.log("memory cleared");
       return false;
     }
@@ -866,8 +958,138 @@ function enableShiftTabToggle(onToggle: () => void): () => void {
   return () => input.off("keypress", onKeypress);
 }
 
+function enablePageUpHistory(rl: readline.Interface): () => void {
+  const input = process.stdin;
+  if (!input.isTTY) return () => {};
+
+  readline.emitKeypressEvents(input);
+  const onKeypress = (_str: string, key: { name?: string }) => {
+    if (key?.name === "pageup") {
+      rl.write(null, { name: "up" });
+    }
+  };
+
+  input.on("keypress", onKeypress);
+  return () => input.off("keypress", onKeypress);
+}
+
+function enablePasteIndicator(
+  onPaste: (info: {
+    phase: PasteMode;
+    chars?: number;
+    text?: string;
+    lineCount?: number;
+    multiline?: boolean;
+    echoedRows?: number;
+  }) => void
+): () => void {
+  const input = process.stdin;
+  if (!input.isTTY) return () => {};
+
+  const BRACKETED_START = "\x1b[200~";
+  const BRACKETED_END = "\x1b[201~";
+
+  let fallbackAcc = "";
+  let fallbackTimer: NodeJS.Timeout | null = null;
+  let bracketAcc = "";
+  let streamAcc = "";
+  let inBracketedPaste = false;
+
+  const estimateEchoedRows = (text: string) => {
+    const cols = Math.max(process.stdout.columns || 80, 10);
+    const lines = text.split("\n");
+    return lines.reduce((rows, line) => rows + Math.max(1, Math.ceil(Math.max(line.length, 1) / cols)), 0);
+  };
+
+  const emitPaste = (raw: string, fromBracketed: boolean) => {
+    const normalized = raw.replace(/\r/g, "");
+    const trimmed = normalized.replace(/\n+$/g, "");
+    if (!trimmed) return;
+    const chars = trimmed.replace(/\n/g, "").length;
+    if (chars < 1) return;
+    const lineCount = trimmed.split("\n").length;
+    const multiline = lineCount > 1;
+    if (!fromBracketed && !multiline && chars < 3) return;
+    onPaste({ phase: "idle", chars, text: trimmed, lineCount, multiline, echoedRows: estimateEchoedRows(trimmed) });
+  };
+
+  const flushFallback = () => {
+    if (!fallbackAcc) return;
+    const next = fallbackAcc;
+    fallbackAcc = "";
+    emitPaste(next, false);
+  };
+
+  const onData = (buf: Buffer | string) => {
+    const chunk = typeof buf === "string" ? buf : buf.toString("utf8");
+    if (!chunk) return;
+
+    streamAcc += chunk;
+    while (streamAcc.length) {
+      if (inBracketedPaste) {
+        const endIdx = streamAcc.indexOf(BRACKETED_END);
+        if (endIdx === -1) {
+          bracketAcc += streamAcc;
+          streamAcc = "";
+          break;
+        }
+        bracketAcc += streamAcc.slice(0, endIdx);
+        streamAcc = streamAcc.slice(endIdx + BRACKETED_END.length);
+        inBracketedPaste = false;
+        emitPaste(bracketAcc, true);
+        bracketAcc = "";
+        continue;
+      }
+
+      const startIdx = streamAcc.indexOf(BRACKETED_START);
+      if (startIdx === -1) break;
+      inBracketedPaste = true;
+      onPaste({ phase: "receiving_paste" });
+      streamAcc = streamAcc.slice(startIdx + BRACKETED_START.length);
+    }
+
+    if (inBracketedPaste) return;
+
+    // Non-bracketed fallback: coalesce quick chunks, but only when newline or burst chunk exists.
+    if (chunk.includes("\x1b")) return;
+    const shouldAggregate = /[\r\n]/.test(chunk) || chunk.length > 1;
+    if (!shouldAggregate) return;
+    onPaste({ phase: "receiving_paste" });
+    fallbackAcc += chunk;
+    if (fallbackTimer) clearTimeout(fallbackTimer);
+    fallbackTimer = setTimeout(() => {
+      fallbackTimer = null;
+      flushFallback();
+    }, 32);
+  };
+
+  input.on("data", onData);
+  return () => {
+    input.off("data", onData);
+    if (fallbackTimer) clearTimeout(fallbackTimer);
+    flushFallback();
+  };
+}
+
 function redrawPrompt(rl: readline.Interface, prompt = "you> "): void {
   process.stdout.write(`\r\x1b[2K${prompt}${rl.line}`);
+}
+
+function clearRecentlyEchoedRows(rows: number): void {
+  if (!process.stdout.isTTY || rows <= 0) return;
+  for (let i = 0; i < rows; i++) {
+    process.stdout.write("\r\x1b[2K");
+    if (i < rows - 1) process.stdout.write("\x1b[1A");
+  }
+  process.stdout.write("\r\x1b[2K");
+}
+
+function insertPlaceholderToken(rl: readline.Interface, token: string, prompt: string): void {
+  const current = String(rl.line || "");
+  const next = current.trim().length ? `${current} ${token}` : token;
+  rl.write(null, { ctrl: true, name: "u" });
+  rl.write(next);
+  redrawPrompt(rl, prompt);
 }
 
 function ghostSuffix(line: string, trimmed: string, ctx: ChatContext): string {
@@ -950,7 +1172,7 @@ function printHelp(): void {
     "/browserpath </usr/sbin/brave>",
     "/searchmode <safe|manual>",
     "/autocontinue <1-120>",
-    "/config (guided setup wizard)",
+    "/config (interactive selectable setup)",
     "/mode <safe|yolo>",
     "/yolo [on|off|toggle] (shortcut: Ctrl+Y)",
     "/root <path>",
@@ -962,96 +1184,423 @@ function printHelp(): void {
     "/memory [show|clear]",
     "/rename <chat-name>",
     "Shift+Tab toggles input mode: chat <-> shell",
+    "Ctrl+V pastes clipboard image as attachment placeholder",
     "<any non-/ text> sends a chat prompt"
   ].join("\n"));
 }
 
 async function runConfigWizard(rl: readline.Interface, ctx: ChatContext): Promise<void> {
-  console.log("Config wizard: press Enter to keep current value.");
-
-  const providerInput = (await question(
-    rl,
-    `Provider [${PROVIDERS.join(", ")}] (${ctx.state.provider.provider}): `
-  )).trim();
-  if (providerInput && PROVIDERS.includes(providerInput as ProviderKind)) {
-    ctx.state = setProvider(ctx.state, { ...ctx.state.provider, provider: providerInput as ProviderKind });
+  const enquirer = await loadEnquirer();
+  if (!enquirer) {
+    console.log("enquirer not available, using fallback config menu.");
+    await runConfigWizardFallback(rl, ctx);
+    return;
   }
 
-  if (ctx.state.provider.provider !== "ollama") {
-    const keyInput = (await question(rl, `API key for ${ctx.state.provider.provider} (stored in config): `)).trim();
-    if (keyInput) {
-      ctx.state = setApiKeyInConfig(ctx.state, ctx.state.provider.provider, keyInput);
+  console.log("Config menu (Enquirer): arrow keys to select, Enter to edit.");
+  let working = { ...ctx.state };
+
+  while (true) {
+    const pick = await enqSelect(rl, enquirer, "Config", [
+      { name: "provider", message: `Provider        : ${working.provider.provider}` },
+      { name: "apikey", message: `API key         : ${working.provider.provider === "ollama" ? "(not required)" : "(set/update)"}` },
+      { name: "model", message: `Model           : ${working.provider.model}` },
+      {
+        name: "endpoint",
+        message: `Endpoint        : ${working.provider.endpoint || (working.provider.provider === "ollama" ? "http://127.0.0.1:11434" : "(none)")}`
+      },
+      { name: "browserpath", message: `Browser path    : ${working.browserExecutablePath || "(default playwright chromium)"}` },
+      { name: "searchmode", message: `Search mode     : ${working.searchMode || "safe"}` },
+      { name: "autocontinue", message: `Auto-continue   : ${working.autoContinueMax ?? 20}` },
+      { name: "projectroot", message: `Project root    : ${working.projectRoot}` },
+      { name: "execmode", message: `Execution mode  : ${working.executionMode || "safe"}` },
+      { name: "save", message: "Save and exit" },
+      { name: "cancel", message: "Cancel" }
+    ]);
+
+    if (pick === "cancel") {
+      console.log("Config canceled.");
+      return;
     }
-  } else {
-    console.log("Ollama selected: API key not required.");
-  }
+    if (pick === "save") {
+      working = { ...working, onboardingComplete: true };
+      ctx.state = working;
+      await saveState(ctx.state);
+      if (ctx.state.projectRoot !== ctx.workspace.projectRoot) {
+        ctx.workspace = await loadWorkspace(ctx.state.projectRoot);
+      }
+      await autoRefreshModels(ctx);
+      console.log("Config saved.");
+      return;
+    }
 
-  const endpointInput = (await question(
-    rl,
-    `Endpoint (${ctx.state.provider.endpoint || (ctx.state.provider.provider === "ollama" ? "http://127.0.0.1:11434" : "none")}): `
-  )).trim();
-  if (endpointInput) {
-    ctx.state = setProvider(ctx.state, { ...ctx.state.provider, endpoint: endpointInput });
-  }
+    if (pick === "provider") {
+      const providerInput = await enqSelect(rl, enquirer, "Provider", PROVIDERS.map((p) => ({ name: p, message: p })), working.provider.provider);
+      if (providerInput && PROVIDERS.includes(providerInput as ProviderKind)) {
+        working = setProvider(working, { ...working.provider, provider: providerInput as ProviderKind });
+        try {
+          const models = await fetchModels(working, working.provider.provider);
+          ctx.modelSuggestions = models;
+          if (models.length && !models.includes(working.provider.model)) {
+            working = setProvider(working, { ...working.provider, model: models[0] });
+          }
+        } catch {
+          // Keep current model if refresh fails.
+        }
+      }
+      continue;
+    }
 
-  const browserPathInput = (await question(
-    rl,
-    `Browser executable path (${ctx.state.browserExecutablePath || "default playwright chromium"}): `
-  )).trim();
-  if (browserPathInput) {
-    ctx.state = { ...ctx.state, browserExecutablePath: browserPathInput };
-  }
+    if (pick === "model") {
+      if (!ctx.modelSuggestions.length) {
+        try {
+          ctx.modelSuggestions = await fetchModels(working, working.provider.provider);
+        } catch {
+          // allow manual entry
+        }
+      }
+      const current = working.provider.model;
+      let modelInput = "";
+      if (ctx.modelSuggestions.length) {
+        const top = ctx.modelSuggestions.slice(0, 50);
+        modelInput = await enqSelect(
+          rl,
+          enquirer,
+          "Model (Top cached)",
+          [...top.map((m) => ({ name: m, message: m })), { name: "__manual__", message: "Manual model id..." }],
+          current
+        );
+        if (modelInput === "__manual__") {
+          modelInput = await enqInput(rl, enquirer, "Model id", current);
+        }
+      } else {
+        modelInput = await enqInput(rl, enquirer, "Model id", current);
+      }
+      if (modelInput) {
+        working = setProvider(working, { ...working.provider, model: modelInput });
+      }
+      continue;
+    }
 
-  const searchModeInput = (await question(
-    rl,
-    `Search mode [safe/manual] (${ctx.state.searchMode || "safe"}): `
-  )).trim().toLowerCase();
-  if (searchModeInput === "safe" || searchModeInput === "manual") {
-    ctx.state = { ...ctx.state, searchMode: searchModeInput };
-  }
+    if (pick === "apikey") {
+      if (working.provider.provider === "ollama") {
+        console.log("Ollama selected: API key not required.");
+        continue;
+      }
+      const keyInput = await enqPassword(rl, enquirer, `API key for ${working.provider.provider}`);
+      if (keyInput) working = setApiKeyInConfig(working, working.provider.provider, keyInput);
+      continue;
+    }
 
-  const autoContinueInput = (await question(
-    rl,
-    `Auto-continue max steps [1-120] (${ctx.state.autoContinueMax ?? 20}): `
-  )).trim();
-  if (autoContinueInput) {
-    const n = Number(autoContinueInput);
-    if (Number.isFinite(n) && n >= 1 && n <= 120) {
-      ctx.state = { ...ctx.state, autoContinueMax: Math.floor(n) };
+    if (pick === "endpoint") {
+      const endpointInput = await enqInput(
+        rl,
+        enquirer,
+        "Endpoint",
+        working.provider.endpoint || (working.provider.provider === "ollama" ? "http://127.0.0.1:11434" : "")
+      );
+      if (endpointInput) working = setProvider(working, { ...working.provider, endpoint: endpointInput });
+      continue;
+    }
+
+    if (pick === "browserpath") {
+      const browserPathInput = await enqInput(
+        rl,
+        enquirer,
+        "Browser executable path",
+        working.browserExecutablePath || ""
+      );
+      if (browserPathInput) working = { ...working, browserExecutablePath: browserPathInput };
+      continue;
+    }
+
+    if (pick === "searchmode") {
+      const searchModeInput = await enqSelect(
+        rl,
+        enquirer,
+        "Search mode",
+        [{ name: "safe", message: "safe" }, { name: "manual", message: "manual" }],
+        working.searchMode || "safe"
+      );
+      if (searchModeInput === "safe" || searchModeInput === "manual") working = { ...working, searchMode: searchModeInput };
+      continue;
+    }
+
+    if (pick === "autocontinue") {
+      const autoContinueInput = await enqInput(rl, enquirer, "Auto-continue max steps [1-120]", String(working.autoContinueMax ?? 20));
+      const n = Number(autoContinueInput);
+      if (Number.isFinite(n) && n >= 1 && n <= 120) working = { ...working, autoContinueMax: Math.floor(n) };
+      continue;
+    }
+
+    if (pick === "projectroot") {
+      const rootInput = await enqInput(rl, enquirer, "Project root", working.projectRoot);
+      if (rootInput) working = { ...working, projectRoot: rootInput };
+      continue;
+    }
+
+    if (pick === "execmode") {
+      const modeInput = await enqSelect(
+        rl,
+        enquirer,
+        "Execution mode",
+        [{ name: "safe", message: "safe" }, { name: "yolo", message: "yolo" }],
+        working.executionMode || "safe"
+      );
+      if (modeInput === "safe" || modeInput === "yolo") working = { ...working, executionMode: modeInput };
+      continue;
     }
   }
+}
 
-  await saveState(ctx.state);
-  await autoRefreshModels(ctx);
+async function runConfigWizardFallback(rl: readline.Interface, ctx: ChatContext): Promise<void> {
+  console.log("Config menu: choose field number, then edit. Enter `s` to save, `q` to cancel.");
+  let working = { ...ctx.state };
 
-  if (ctx.modelSuggestions.length) {
-    const current = ctx.state.provider.model;
-    const shown = ctx.modelSuggestions.slice(0, 20);
-    console.log("Available models:");
-    shown.forEach((m, i) => console.log(`${i + 1}. ${m}`));
+  while (true) {
+    console.log([
+      "",
+      `1) Provider        : ${working.provider.provider}`,
+      `2) API key         : ${working.provider.provider === "ollama" ? "(not required)" : "(set/update)"}`,
+      `3) Model           : ${working.provider.model}`,
+      `4) Endpoint        : ${working.provider.endpoint || (working.provider.provider === "ollama" ? "http://127.0.0.1:11434" : "(none)")}`,
+      `5) Browser path    : ${working.browserExecutablePath || "(default playwright chromium)"}`,
+      `6) Search mode     : ${working.searchMode || "safe"}`,
+      `7) Auto-continue   : ${working.autoContinueMax ?? 20}`,
+      `8) Project root    : ${working.projectRoot}`,
+      `9) Execution mode  : ${working.executionMode || "safe"}`,
+      "s) Save and exit",
+      "q) Cancel"
+    ].join("\n"));
 
-    const modelInput = (await question(rl, `Model (${current}): `)).trim();
-    if (modelInput) {
-      const idx = Number(modelInput);
-      const next = Number.isInteger(idx) && idx >= 1 && idx <= shown.length ? shown[idx - 1] : modelInput;
-      ctx.state = setProvider(ctx.state, { ...ctx.state.provider, model: next });
+    const pick = (await question(rl, "config> ")).trim().toLowerCase();
+    if (pick === "q") return;
+    if (pick === "s") {
+      working = { ...working, onboardingComplete: true };
+      ctx.state = working;
+      await saveState(ctx.state);
+      if (ctx.state.projectRoot !== ctx.workspace.projectRoot) {
+        ctx.workspace = await loadWorkspace(ctx.state.projectRoot);
+      }
+      await autoRefreshModels(ctx);
+      console.log("Config saved.");
+      return;
+    }
+    if (pick === "1") {
+      const providerInput = (await question(rl, `Provider [${PROVIDERS.join(", ")}] (${working.provider.provider}): `)).trim();
+      if (providerInput && PROVIDERS.includes(providerInput as ProviderKind)) {
+        working = setProvider(working, { ...working.provider, provider: providerInput as ProviderKind });
+      }
+      continue;
+    }
+    if (pick === "2") {
+      if (working.provider.provider === "ollama") continue;
+      const keyInput = (await question(rl, `API key for ${working.provider.provider}: `)).trim();
+      if (keyInput) working = setApiKeyInConfig(working, working.provider.provider, keyInput);
+      continue;
+    }
+    if (pick === "3") {
+      const modelInput = (await question(rl, `Model (${working.provider.model}): `)).trim();
+      if (modelInput) working = setProvider(working, { ...working.provider, model: modelInput });
+      continue;
+    }
+    if (pick === "4") {
+      const endpointInput = (await question(rl, "Endpoint: ")).trim();
+      if (endpointInput) working = setProvider(working, { ...working.provider, endpoint: endpointInput });
+      continue;
+    }
+    if (pick === "5") {
+      const browserPathInput = (await question(rl, "Browser executable path: ")).trim();
+      if (browserPathInput) working = { ...working, browserExecutablePath: browserPathInput };
+      continue;
+    }
+    if (pick === "6") {
+      const searchModeInput = (await question(rl, "Search mode [safe/manual]: ")).trim().toLowerCase();
+      if (searchModeInput === "safe" || searchModeInput === "manual") working = { ...working, searchMode: searchModeInput };
+      continue;
+    }
+    if (pick === "7") {
+      const autoContinueInput = (await question(rl, "Auto-continue [1-120]: ")).trim();
+      const n = Number(autoContinueInput);
+      if (Number.isFinite(n) && n >= 1 && n <= 120) working = { ...working, autoContinueMax: Math.floor(n) };
+      continue;
+    }
+    if (pick === "8") {
+      const rootInput = (await question(rl, `Project root (${working.projectRoot}): `)).trim();
+      if (rootInput) working = { ...working, projectRoot: rootInput };
+      continue;
+    }
+    if (pick === "9") {
+      const modeInput = (await question(rl, "Execution mode [safe/yolo]: ")).trim().toLowerCase();
+      if (modeInput === "safe" || modeInput === "yolo") working = { ...working, executionMode: modeInput };
     }
   }
+}
 
-  const rootInput = (await question(rl, `Project root (${ctx.state.projectRoot}): `)).trim();
-  if (rootInput) {
-    ctx.state = { ...ctx.state, projectRoot: rootInput };
-    ctx.workspace = await loadWorkspace(ctx.state.projectRoot);
+type EnquirerModule = {
+  prompt: (question: Record<string, unknown>) => Promise<Record<string, string>>;
+};
+
+async function loadEnquirer(): Promise<EnquirerModule | null> {
+  try {
+    const mod = await import("enquirer");
+    const anyMod = mod as any;
+    const promptFn =
+      (typeof anyMod?.prompt === "function" && anyMod.prompt) ||
+      (typeof anyMod?.default?.prompt === "function" && anyMod.default.prompt) ||
+      (typeof anyMod?.default === "function" && typeof anyMod.default.prompt === "function" && anyMod.default.prompt) ||
+      null;
+    if (!promptFn) return null;
+    return { prompt: promptFn as EnquirerModule["prompt"] };
+  } catch {
+    return null;
   }
+}
 
-  const modeInput = (await question(rl, `Execution mode [safe/yolo] (${ctx.state.executionMode || "safe"}): `))
-    .trim()
-    .toLowerCase();
-  if (modeInput === "safe" || modeInput === "yolo") {
-    ctx.state = { ...ctx.state, executionMode: modeInput };
+async function enqSelect(
+  rl: readline.Interface,
+  enquirer: EnquirerModule,
+  message: string,
+  choices: Array<{ name: string; message: string }>,
+  initial?: string
+): Promise<string> {
+  const initialIndex = typeof initial === "string" ? Math.max(0, choices.findIndex((c) => c.name === initial)) : 0;
+  const out = await withRlPaused(rl, async () => {
+    const ans = await enquirer.prompt({
+      type: "select",
+      name: "value",
+      message,
+      choices,
+      initial: initialIndex
+    });
+    return String(ans.value || "");
+  });
+  return out;
+}
+
+async function enqInput(rl: readline.Interface, enquirer: EnquirerModule, message: string, initial = ""): Promise<string> {
+  return await withRlPaused(rl, async () => {
+    const ans = await enquirer.prompt({
+      type: "input",
+      name: "value",
+      message,
+      initial
+    });
+    return String(ans.value || "").trim();
+  });
+}
+
+async function enqPassword(rl: readline.Interface, enquirer: EnquirerModule, message: string): Promise<string> {
+  return await withRlPaused(rl, async () => {
+    const ans = await enquirer.prompt({
+      type: "password",
+      name: "value",
+      message
+    });
+    return String(ans.value || "").trim();
+  });
+}
+
+async function withRlPaused<T>(rl: readline.Interface, fn: () => Promise<T>): Promise<T> {
+  rl.pause();
+  try {
+    return await fn();
+  } finally {
+    rl.resume();
   }
+}
 
-  ctx.state = { ...ctx.state, onboardingComplete: true };
-  await saveState(ctx.state);
-  console.log("Config saved.");
+function sessionMemoryDigest(turns: ChatTurn[]): string {
+  const recent = turns.slice(-24);
+  const pairs: string[] = [];
+  for (let i = 0; i < recent.length; i++) {
+    const t = recent[i];
+    if (t.role !== "user") continue;
+    const a = recent.slice(i + 1).find((x) => x.role === "assistant");
+    pairs.push(`- ${trimForDigest(t.content)} => ${trimForDigest(a?.content || "(pending)")}`);
+  }
+  return [
+    "Session memory (current chat only):",
+    ...(pairs.length ? pairs.slice(-8) : ["(empty)"])
+  ].join("\n");
+}
+
+function trimForDigest(s: string): string {
+  const one = String(s || "").replace(/\s+/g, " ").trim();
+  if (!one) return "(empty)";
+  return one.length > 120 ? `${one.slice(0, 120)}...` : one;
+}
+
+async function pasteImageFromClipboard(projectRoot: string): Promise<{ path: string; mime: string; bytes: number } | null> {
+  const image = await readClipboardImage();
+  if (!image || !image.bytes.length) return null;
+  const ext = image.mime === "image/jpeg" ? "jpg" : image.mime === "image/webp" ? "webp" : "png";
+  const dir = join(projectRoot, ".forge-data", "pastes");
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, `clipboard-${Date.now()}.${ext}`);
+  await writeFile(path, image.bytes);
+  return { path, mime: image.mime, bytes: image.bytes.length };
+}
+
+async function readClipboardImage(): Promise<{ bytes: Buffer; mime: string } | null> {
+  const linuxWayland = await readClipboardVia("wl-paste", ["--list-types"], null, async (types) => {
+    const mime = pickImageMime(types);
+    if (!mime) return null;
+    const bytes = await runCmdCollectStdout("wl-paste", ["--no-newline", "--type", mime], null);
+    return bytes.length ? { bytes, mime } : null;
+  });
+  if (linuxWayland) return linuxWayland;
+
+  const linuxX11Png = await runCmdCollectStdout("xclip", ["-selection", "clipboard", "-t", "image/png", "-o"], null);
+  if (linuxX11Png.length) return { bytes: linuxX11Png, mime: "image/png" };
+  const linuxX11Jpg = await runCmdCollectStdout("xclip", ["-selection", "clipboard", "-t", "image/jpeg", "-o"], null);
+  if (linuxX11Jpg.length) return { bytes: linuxX11Jpg, mime: "image/jpeg" };
+
+  const macPng = await runCmdCollectStdout("pngpaste", ["-"], null);
+  if (macPng.length) return { bytes: macPng, mime: "image/png" };
+  return null;
+}
+
+async function readClipboardVia<T>(
+  command: string,
+  args: string[],
+  stdin: string | null,
+  mapper: (stdoutText: string) => Promise<T | null>
+): Promise<T | null> {
+  const out = await runCmdCollectStdout(command, args, stdin);
+  if (!out.length) return null;
+  return await mapper(out.toString("utf8"));
+}
+
+function pickImageMime(types: string): string | null {
+  const lines = types
+    .split(/\r?\n/)
+    .map((line) => line.trim().toLowerCase())
+    .filter(Boolean);
+  for (const mime of ["image/png", "image/jpeg", "image/webp"]) {
+    if (lines.includes(mime)) return mime;
+  }
+  return null;
+}
+
+async function runCmdCollectStdout(command: string, args: string[], stdinText: string | null): Promise<Buffer> {
+  return await new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: ["pipe", "pipe", "ignore"] });
+    const chunks: Buffer[] = [];
+    let settled = false;
+    const finish = (buf: Buffer) => {
+      if (settled) return;
+      settled = true;
+      resolve(buf);
+    };
+
+    child.on("error", () => finish(Buffer.alloc(0)));
+    child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    child.on("close", (code) => {
+      if (code !== 0) return finish(Buffer.alloc(0));
+      finish(Buffer.concat(chunks));
+    });
+    if (stdinText !== null && child.stdin) child.stdin.write(stdinText);
+    if (child.stdin) child.stdin.end();
+  });
 }

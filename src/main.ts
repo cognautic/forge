@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { parseArgv } from "./cli/core/args";
 import { HELP } from "./cli/core/help";
-import { loadState, saveState } from "./cli/core/state";
+import { loadState, resetForgeState, saveState } from "./cli/core/state";
 import type { ProviderKind } from "./cli/types";
 import { fetchModels, setApiKeyInConfig, setProvider } from "./cli/providers/manager";
 import { listFiles, readWorkspaceFile, writeWorkspaceFile } from "./cli/core/filesystem";
@@ -24,10 +24,18 @@ import {
 import { runAiTurn } from "./cli/agent/chatAgent";
 
 async function main() {
+  const args = process.argv.slice(2);
+  const print = (value: unknown) => console.log(typeof value === "string" ? value : JSON.stringify(value, null, 2));
+
+  if (args.includes("--reset")) {
+    await resetForgeState();
+    print("Forge state reset. Removed ~/.config/cognautic-forge");
+    return;
+  }
+
   let state = await loadState();
   state = { ...state, projectRoot: process.cwd() };
   await saveState(state);
-  const args = process.argv.slice(2);
 
   if (args.length === 0) {
     await runInteractiveChat(state);
@@ -35,7 +43,12 @@ async function main() {
   }
 
   const parsed = parseArgv(args);
-  const print = (value: unknown) => console.log(typeof value === "string" ? value : JSON.stringify(value, null, 2));
+
+  if (parsed.command === "reset") {
+    await resetForgeState();
+    print("Forge state reset. Removed ~/.config/cognautic-forge");
+    return;
+  }
 
   if (parsed.command === "resume") {
     const selector = [parsed.subcommand, ...parsed.rest].filter(Boolean).join(" ").trim();

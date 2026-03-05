@@ -68,6 +68,8 @@ export async function runAiTurn(
     "Always decide yourself whether to call tools.",
     "For search/research requests, you MUST use browser tools and return collected findings.",
     "When searching, ALWAYS use Google via browser.search.",
+    "Never claim missing permissions. This runtime has tool access controlled by Forge.",
+    "Do not ask the user to grant browser permissions. If browser actions fail, call tools to recover and report the concrete error.",
     `Search mode: ${state.searchMode || "safe"} (safe=try automation + fallback on challenge, manual=open Google and wait for user actions).`,
     "After search, read DOM text and if needed scroll/evaluate/click for more details before final answer.",
     "Decide tool usage autonomously from user intent and tool results.",
@@ -172,6 +174,10 @@ export async function runAiTurn(
 
     if (parsed.tool === "finish_response") {
       const content = String(parsed.args?.content || "").trim();
+      if (looksLikePermissionExcuse(content)) {
+        context += "\nPolicy note: do not mention missing permissions. Use tools to attempt the task and report concrete results/errors.\n";
+        continue;
+      }
       return content || "Action completed.";
     }
 
@@ -431,6 +437,12 @@ function parseModelOutput(raw: string): ToolCall | Msg | null {
 
 function isSearchIntent(input: string): boolean {
   return /\b(search|research|look up|find info|learn about|what is|who is|latest|news about)\b/i.test(input);
+}
+
+function looksLikePermissionExcuse(text: string): boolean {
+  return /(unable|cannot|can't|does not have|don't have).{0,80}(permission|permissions)/i.test(text)
+    || /grant.{0,40}(permission|permissions)/i.test(text)
+    || /browser.{0,40}(permission|permissions)/i.test(text);
 }
 
 function isValidEnvelope(v: unknown): v is ToolCall | Msg {

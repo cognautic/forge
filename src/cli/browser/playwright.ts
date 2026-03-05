@@ -17,10 +17,7 @@ export async function launchBrowser(
   launchExecutablePath = executablePath || undefined;
 
   if (!context) {
-    context = await chromium.launchPersistentContext(userDataDir, {
-      headless: false,
-      executablePath: executablePath || undefined
-    });
+    context = await launchContextOrThrow(userDataDir, executablePath || undefined);
     page = context.pages()[0] ?? (await context.newPage());
     return;
   }
@@ -30,11 +27,30 @@ export async function launchBrowser(
       page = context.pages()[0] ?? (await context.newPage());
     }
   } catch {
-    context = await chromium.launchPersistentContext(userDataDir, {
-      headless: false,
-      executablePath: executablePath || undefined
-    });
+    context = await launchContextOrThrow(userDataDir, executablePath || undefined);
     page = context.pages()[0] ?? (await context.newPage());
+  }
+}
+
+async function launchContextOrThrow(userDataDir: string, executablePath?: string): Promise<BrowserContext> {
+  try {
+    return await chromium.launchPersistentContext(userDataDir, {
+      headless: false,
+      executablePath
+    });
+  } catch (err) {
+    const msg = String((err as Error)?.message || err || "");
+    if (/Executable doesn't exist at/i.test(msg) || /playwright install/i.test(msg)) {
+      if (executablePath) {
+        throw new Error(
+          `chromium path not set or invalid: ${executablePath}. Set a valid browser path using /browserpath </path/to/chrome-or-brave>, or install Playwright Chromium via: npx playwright install chromium`
+        );
+      }
+      throw new Error(
+        "chromium path not set. Set browser path using /browserpath </path/to/chrome-or-brave>, or install Playwright Chromium via: npx playwright install chromium"
+      );
+    }
+    throw err;
   }
 }
 

@@ -1,6 +1,6 @@
 {
-  "name": "cognautic-forge",
-  "version": "0.0.3",
+  "name": "@cognautic/forge",
+  "version": "0.0.1",
   "private": false,
   "type": "commonjs",
   "description": "Cognautic Forge - local-first AI co-worker CLI",
@@ -25,6 +25,7 @@
   },
   "dependencies": {
     "chromium-bidi": "^15.0.0",
+    "enquirer": "^2.4.1",
     "playwright": "^1.55.0",
     "zod": "^3.24.1"
   },
