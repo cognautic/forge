@@ -7,11 +7,13 @@ import {
   evaluate,
   extract,
   launchBrowser,
+  resetBrowser,
   moveAiCursor,
   navigate,
   openGoogleHome,
   readDomText,
   scrollPage,
+  searchDuckDuckGo,
   searchGoogle,
   setAiCursorVisible,
   setVisualOverlay,
@@ -23,6 +25,7 @@ import { systemKeyboardType, systemMouseClick, systemMouseMove, systemOcr, syste
 
 type ToolCall = { type: "tool"; tool: string; args?: Record<string, unknown> };
 type Msg = { type: "message"; content: string };
+let lastWebSearchAt = 0;
 
 export async function runAiTurn(
   state: ForgeState,
@@ -66,8 +69,7 @@ export async function runAiTurn(
     "Before acting, infer the active task and lifecycle stage: Proposed/Approved/In Progress/Under Review/Completed/Archived.",
     "Prefer deterministic execution over speculative autonomy.",
     "Always decide yourself whether to call tools.",
-    "For search/research requests, you MUST use browser tools and return collected findings.",
-    "When searching, ALWAYS use Google via browser.search.",
+    "For search/research requests, prefer web.search + web.read (no browser). Use browser tools only as fallback.",
     "Never claim missing permissions. This runtime has tool access controlled by Forge.",
     "Do not ask the user to grant browser permissions. If browser actions fail, call tools to recover and report the concrete error.",
     `Search mode: ${state.searchMode || "safe"} (safe=try automation + fallback on challenge, manual=open Google and wait for user actions).`,
@@ -77,11 +79,13 @@ export async function runAiTurn(
     "JSON schema:",
     "{\"type\":\"message\",\"content\":\"...\"}",
     "or",
-    "{\"type\":\"tool\",\"tool\":\"browser.search\",\"args\":{\"query\":\"...\"}}",
+    "{\"type\":\"tool\",\"tool\":\"web.search\",\"args\":{\"query\":\"...\"}}",
     "Available tools:",
     "browser.launch { }",
     "browser.goto { url }",
     "browser.search { query }",
+    "web.search { query }",
+    "web.read { url, limit }",
     "browser.read_dom { limit }",
     "browser.scroll { pixels }",
     "browser.extract { selector }",
@@ -98,6 +102,7 @@ export async function runAiTurn(
     "system.mouse_click { button }",
     "system.keyboard_type { text }",
     "system.screen_capture { }",
+    "cognautic.screen_share { }",
     "system.screen_ocr { image_path }",
     "command.run { command }",
     "system.exec { command }",
@@ -119,13 +124,15 @@ export async function runAiTurn(
     "     - Example: {\"type\":\"tool\",\"tool\":\"command.run\",\"args\":{\"command\":\"nohup npm install > .forge-data/bg/npm-install.log 2>&1 &\"}}",
     "     - After starting bg task, continue with other tools and optionally inspect logs using files.read.",
     "3) For local UI control tasks:",
-    "   a) system.screen_capture -> system.screen_ocr",
+    "   a) cognautic.screen_share (or system.screen_capture) -> system.screen_ocr",
     "   b) system.mouse_move/system.mouse_click/system.keyboard_type",
     "   c) repeat capture/ocr to verify results",
-    "4) For browser research tasks:",
-    "   a) browser.search (Google)",
-    "   b) browser.read_dom, browser.scroll, browser.extract/browser.eval",
-    "   c) then finish_response with findings",
+    "   d) NEVER use command.run/system.exec for screenshots when cognautic.screen_share exists",
+    "4) For research tasks (preferred no-browser):",
+    "   a) web.search",
+    "   b) web.read on relevant result URLs",
+    "   c) use browser tools only as fallback",
+    "   d) then finish_response with findings",
     "5) ALWAYS end with finish_response { content } when done.",
     "6) finish_response content MUST be a human-readable summary of what you did and what happened.",
     "",
@@ -147,8 +154,7 @@ export async function runAiTurn(
 
   let context = `${system}\n\nUser: ${userInput}\n`;
   let stepsSinceFollowUp = 0;
-  const maxTotalSteps = Math.min(120, Math.max(1, Math.floor(state.autoContinueMax ?? 20)));
-  for (let i = 0; i < maxTotalSteps; i++) {
+  for (let i = 0; ; i++) {
     throwIfAborted();
     opts?.onStatus?.(`thinking (step ${i + 1})`);
     let raw = "";
@@ -156,6 +162,19 @@ export async function runAiTurn(
       raw = await completeText(state, context, signal);
     } catch (err: any) {
       if (signal?.aborted || err?.name === "AbortError") return "Stopped.";
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/HTTP 429|Too Many Requests/i.test(msg)) {
+        const waitMs = Math.min(15000, 2000 * Math.max(1, i + 1));
+        const totalSeconds = Math.ceil(waitMs / 1000);
+        for (let remaining = totalSeconds; remaining > 0; remaining--) {
+          throwIfAborted();
+          opts?.onStatus?.(`rate-limited, retrying in ${remaining}s`);
+          await sleep(1000);
+        }
+        context += `\nRate-limit note: provider returned 429; waited ${waitMs}ms and retrying.\n`;
+        i--;
+        continue;
+      }
       throw err;
     }
     throwIfAborted();
@@ -193,7 +212,14 @@ export async function runAiTurn(
 
     throwIfAborted();
     if (!signal?.aborted) opts?.onToolCall?.(parsed.tool, parsed.args || {});
-    const toolResult = await executeTool(state, parsed);
+    let toolResult = "";
+    try {
+      toolResult = await executeTool(state, parsed);
+    } catch (err: any) {
+      if (signal?.aborted || err?.name === "AbortError") throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      toolResult = `tool_error(${parsed.tool}): ${message}`;
+    }
     throwIfAborted();
     if (!signal?.aborted) opts?.onToolResult?.(parsed.tool, String(toolResult).slice(0, 260));
     context += `\nTool call ${i + 1}: ${JSON.stringify(parsed)}\nTool result ${i + 1}: ${toolResult}\n`;
@@ -206,11 +232,13 @@ export async function runAiTurn(
     }
   }
 
-  return "Agent hit safety limit before finish_response. Try a narrower request.";
 }
 
 async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   const args = call.args || {};
+  if (call.tool.startsWith("browser.")) {
+    return await executeBrowserToolWithRecovery(state, call.tool, args);
+  }
 
   if (call.tool === "browser.launch") {
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
@@ -344,10 +372,90 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
     return `screenshot saved: ${path}`;
   }
 
+  if (call.tool === "cognautic.screen_share") {
+    const path = await systemScreenshot(".forge-data/screens");
+    return `screen_share saved: ${path}`;
+  }
+
   if (call.tool === "system.screen_ocr") {
     const imagePath = String(args.image_path || "");
     if (!imagePath) return "missing image_path";
     return await systemOcr(imagePath);
+  }
+
+  if (call.tool === "web.search") {
+    const query = String(args.query || "").trim();
+    if (!query) return "missing query";
+    await waitForWebSearchSlot();
+    let items: Array<{ title: string; url: string }> = [];
+    let lastError = "";
+
+    const liteUrl = `https://lite.duckduckgo.com/lite/?${new URLSearchParams({ q: query }).toString()}`;
+    const liteRes = await fetchWithUa(liteUrl);
+    if (liteRes.ok) {
+      const lite = await liteRes.text();
+        items = extractDuckDuckGoResults(lite).slice(0, 10);
+      if (!items.length) items = extractExternalUrlsFromHtml(lite).slice(0, 10);
+    } else {
+      lastError = `HTTP ${liteRes.status}`;
+      if (liteRes.status === 429) await sleep(2000);
+    }
+
+    if (!items.length) {
+      const htmlUrl = `https://duckduckgo.com/html/?${new URLSearchParams({ q: query }).toString()}`;
+      const htmlRes = await fetchWithUa(htmlUrl);
+      if (htmlRes.ok) {
+        const html = await htmlRes.text();
+        items = extractDuckDuckGoResults(html).slice(0, 10);
+        if (!items.length) items = extractExternalUrlsFromHtml(html).slice(0, 10);
+      } else {
+        lastError = `HTTP ${htmlRes.status}`;
+        if (htmlRes.status === 429) await sleep(2000);
+      }
+    }
+
+    if (!items.length) {
+      const apiUrl = `https://api.duckduckgo.com/?${new URLSearchParams({
+        q: query,
+        format: "json",
+        no_html: "1",
+        no_redirect: "1",
+        skip_disambig: "1"
+      }).toString()}`;
+      const apiRes = await fetchWithUa(apiUrl);
+      if (apiRes.ok) {
+        const apiJson = await apiRes.json();
+        items = extractDuckDuckGoApiResults(apiJson).slice(0, 10);
+      } else {
+        lastError = `HTTP ${apiRes.status}`;
+      }
+    }
+
+    if (!items.length && lastError.includes("429")) return "web.search failed: HTTP 429 (rate limited)";
+    if (!items.length) return "web.search: no results";
+    return items.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`).join("\n");
+  }
+
+  if (call.tool === "web.read") {
+    const url = String(args.url || "").trim();
+    const limit = Math.min(20000, Math.max(500, Number(args.limit || 6000)));
+    if (!url) return "missing url";
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return `web.read failed: invalid url "${url}"`;
+    }
+    if (!/^https?:$/.test(parsed.protocol)) return "web.read failed: only http/https urls are allowed";
+    const res = await fetch(parsed.toString(), {
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+      }
+    });
+    if (!res.ok) return `web.read failed: HTTP ${res.status}`;
+    const html = await res.text();
+    return htmlToText(html).slice(0, limit);
   }
 
   if (call.tool === "system.exec") {
@@ -408,6 +516,142 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
   }
 
   return `unknown tool: ${call.tool}`;
+}
+
+async function executeBrowserToolWithRecovery(
+  state: ForgeState,
+  tool: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const run = async () => {
+    if (tool === "browser.launch") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      return "browser launched";
+    }
+
+    if (tool === "browser.goto") {
+      const url = String(args.url || "https://example.com");
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      await navigate(url);
+      return `navigated: ${url}`;
+    }
+
+    if (tool === "browser.search") {
+      const query = String(args.query || "");
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      if ((state.searchMode || "safe") === "manual") {
+        await openGoogleHome();
+        return `manual_mode: opened Google home. Ask user to search "${query}" manually, then continue with browser.read_dom/browser.extract to summarize results.`;
+      }
+      await searchDuckDuckGo(query);
+      const chkDuck = await detectBotChallenge();
+      if (chkDuck.challenged) {
+        await searchGoogle(query);
+        const chkGoogle = await detectBotChallenge();
+        if (chkGoogle.challenged) {
+          await openGoogleHome();
+          return `challenge_detected: ${chkGoogle.reason || "unknown"} at ${chkGoogle.url}. Fallback: ask user to complete captcha/search manually, then continue with browser.read_dom + summarization.`;
+        }
+      }
+      return `searched: ${query}`;
+    }
+
+    if (tool === "browser.read_dom") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      const chk = await detectBotChallenge();
+      if (chk.challenged) {
+        return `challenge_detected: ${chk.reason || "unknown"} at ${chk.url}. Cannot read meaningful results until user passes challenge.`;
+      }
+      const limit = Number(args.limit || 6000);
+      return await readDomText(limit);
+    }
+
+    if (tool === "browser.scroll") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      const pixels = Number(args.pixels || 1200);
+      await scrollPage(pixels);
+      return `scrolled ${pixels}`;
+    }
+
+    if (tool === "browser.extract") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      const selector = String(args.selector || "body");
+      return await extract(selector);
+    }
+
+    if (tool === "browser.click") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      const selector = String(args.selector || "a");
+      await click(selector);
+      return `clicked ${selector}`;
+    }
+
+    if (tool === "browser.eval") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      const script = String(args.script || "document.title");
+      const out = await evaluate(script);
+      return JSON.stringify(out).slice(0, 2000);
+    }
+
+    if (tool === "browser.overlay_on") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      await setVisualOverlay(true);
+      return "overlay enabled";
+    }
+
+    if (tool === "browser.overlay_off") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      await setVisualOverlay(false);
+      return "overlay disabled";
+    }
+
+    if (tool === "browser.cursor_move") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      const x = Number(args.x ?? 120);
+      const y = Number(args.y ?? 120);
+      await moveAiCursor(x, y);
+      return `cursor moved to ${x},${y}`;
+    }
+
+    if (tool === "browser.cursor_click") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      const button = String(args.button || "left") as "left" | "right" | "middle";
+      await clickAiCursor(button);
+      return `cursor clicked ${button}`;
+    }
+
+    if (tool === "browser.cursor_type") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      const text = String(args.text || "");
+      await typeAtCursor(text);
+      return `cursor typed ${text.length} chars`;
+    }
+
+    if (tool === "browser.cursor_show") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      await setAiCursorVisible(true);
+      return "browser ai cursor shown";
+    }
+
+    if (tool === "browser.cursor_hide") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      await setAiCursorVisible(false);
+      return "browser ai cursor hidden";
+    }
+
+    return `unknown tool: ${tool}`;
+  };
+
+  try {
+    return await run();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!/has been closed|Target page, context or browser has been closed|context closed|browser closed/i.test(message)) {
+      throw err;
+    }
+    await resetBrowser();
+    return await run();
+  }
 }
 
 function parseModelOutput(raw: string): ToolCall | Msg | null {
@@ -514,4 +758,183 @@ function blockedCommandMessage(program: string): string | null {
     return "blocked: rfkill is disabled for safety. Use nmcli instead (e.g., 'nmcli radio wifi on|off' or 'nmcli radio wifi').";
   }
   return null;
+}
+
+function extractDuckDuckGoApiResults(payload: any): Array<{ title: string; url: string }> {
+  const out: Array<{ title: string; url: string }> = [];
+  const push = (title: string, url: string) => {
+    const t = String(title || "").trim();
+    const normalized = normalizeDuckDuckGoHref(String(url || "").trim());
+    if (!t || !normalized || !/^https?:\/\//i.test(normalized)) return;
+    if (!isUsableSearchResult(normalized, t)) return;
+    out.push({ title: t, url: normalized });
+  };
+
+  push(payload?.Heading, payload?.AbstractURL);
+  if (Array.isArray(payload?.Results)) {
+    for (const r of payload.Results) push(r?.Text, r?.FirstURL);
+  }
+  const walk = (topics: any[]) => {
+    for (const t of topics) {
+      if (Array.isArray(t?.Topics)) {
+        walk(t.Topics);
+      } else {
+        push(t?.Text, t?.FirstURL);
+      }
+    }
+  };
+  if (Array.isArray(payload?.RelatedTopics)) walk(payload.RelatedTopics);
+  return out;
+}
+
+function extractDuckDuckGoResults(html: string): Array<{ title: string; url: string }> {
+  const out: Array<{ title: string; url: string }> = [];
+  const re = /<a[^>]+href=['"]([^'"]+)['"][^>]*>([\s\S]*?)<\/a>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    const href = decodeHtmlEntities(m[1] || "").trim();
+    const title = htmlToText(m[2] || "").replace(/\s+/g, " ").trim();
+    const url = normalizeDuckDuckGoHref(href);
+    if (!url || !title || title.length < 3) continue;
+    if (!isUsableSearchResult(url, title)) continue;
+    out.push({ title, url });
+  }
+  return dedupeResults(out);
+}
+
+function normalizeDuckDuckGoHref(href: string): string {
+  if (!href) return "";
+  if (/^javascript:/i.test(href)) return "";
+  if (href.startsWith("//")) href = `https:${href}`;
+  if (href.startsWith("http://") || href.startsWith("https://")) {
+    try {
+      const u = new URL(href);
+      if (u.hostname.includes("duckduckgo.com") && u.searchParams.get("uddg")) {
+        return decodeURIComponent(u.searchParams.get("uddg") || "");
+      }
+      return href;
+    } catch {
+      return href;
+    }
+  }
+  if (!href.startsWith("/l/?")) return "";
+  try {
+    const u = new URL(`https://duckduckgo.com${href}`);
+    return decodeURIComponent(u.searchParams.get("uddg") || "");
+  } catch {
+    return "";
+  }
+}
+
+function htmlToText(html: string): string {
+  const noScript = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ");
+  const text = noScript
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return decodeHtmlEntities(text);
+}
+
+function decodeHtmlEntities(input: string): string {
+  return input
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'");
+}
+
+function isUsableSearchResult(url: string, title: string): boolean {
+  const t = title.trim().toLowerCase();
+  if (t === "here" || t === "more" || t === "duckduckgo") return false;
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    if (host === "duckduckgo.com" || host.endsWith(".duckduckgo.com")) return false;
+    if (host === "duck.ai" || host.endsWith(".duck.ai")) return false;
+    if (host === "www.w3.org" && /\/tr\/html4\/loose\.dtd$/i.test(u.pathname)) return false;
+    if (/\.dtd$/i.test(u.pathname)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function dedupeResults(items: Array<{ title: string; url: string }>): Array<{ title: string; url: string }> {
+  const seen = new Set<string>();
+  const out: Array<{ title: string; url: string }> = [];
+  for (const it of items) {
+    const key = it.url.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+
+function extractExternalUrlsFromHtml(html: string): Array<{ title: string; url: string }> {
+  const out: Array<{ title: string; url: string }> = [];
+
+  // Prefer DDG redirect targets, which are the actual result URLs.
+  const uddgRe = /[?&]uddg=([^&"'<>\\s]+)/gi;
+  let um: RegExpExecArray | null;
+  while ((um = uddgRe.exec(html))) {
+    const decoded = decodeURIComponent(decodeHtmlEntities(um[1] || "").trim());
+    const url = normalizeDuckDuckGoHref(decoded);
+    if (!url) continue;
+    if (!isUsableSearchResult(url, url)) continue;
+    out.push({ title: hostTitle(url), url });
+  }
+
+  const hrefRe = /href=['"]([^'"]+)['"]/gi;
+  let m: RegExpExecArray | null;
+  while ((m = hrefRe.exec(html))) {
+    const raw = decodeHtmlEntities(m[1] || "").trim();
+    const url = normalizeDuckDuckGoHref(raw);
+    if (!url) continue;
+    if (!isUsableSearchResult(url, url)) continue;
+    out.push({ title: hostTitle(url), url });
+  }
+
+  const textUrls = html.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+  for (const raw of textUrls) {
+    const url = normalizeDuckDuckGoHref(decodeHtmlEntities(raw).trim());
+    if (!url) continue;
+    if (!isUsableSearchResult(url, url)) continue;
+    out.push({ title: hostTitle(url), url });
+  }
+
+  return dedupeResults(out);
+}
+
+function hostTitle(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.hostname.replace(/^www\./, "");
+  } catch {
+    return "result";
+  }
+}
+
+async function waitForWebSearchSlot(): Promise<void> {
+  const now = Date.now();
+  const waitMs = Math.max(0, 2000 - (now - lastWebSearchAt));
+  if (waitMs > 0) await sleep(waitMs);
+  lastWebSearchAt = Date.now();
+}
+
+async function fetchWithUa(url: string): Promise<Response> {
+  return await fetch(url, {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

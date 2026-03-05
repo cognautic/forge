@@ -58,7 +58,6 @@ const COMMANDS = [
   "/endpoint",
   "/browserpath",
   "/searchmode",
-  "/autocontinue",
   "/config",
   "/objective",
   "/task",
@@ -93,6 +92,8 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   let pendingAttachments: PendingAttachment[] = [];
   let pendingImagePastes: Array<{ path: string; mime: string; bytes: number }> = [];
   let imagePasteBusy = false;
+  let lastSubmittedInput = "";
+  let lastSubmittedAt = 0;
   const onImagePasteKey = async (_str: string, key: { name?: string; ctrl?: boolean }) => {
     if (!key?.ctrl || key.name !== "v") return;
     if (imagePasteBusy || !process.stdin.isTTY) return;
@@ -139,7 +140,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     activeTurnAbort.abort();
     if (activeSpinner) activeSpinner.stop();
     process.stdout.write("\n[stopping ai response...]\n");
-  });
+  }, () => Boolean(activeTurnAbort && !activeTurnAbort.signal.aborted));
   const stopCtrlYToggle = enableCtrlYToggle(async () => {
     ctx.state = {
       ...ctx.state,
@@ -155,14 +156,24 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     redrawPrompt(rl, promptPrefix());
   });
   const stopPageUpHistory = enablePageUpHistory(rl);
-  const autosaveTimer = setInterval(async () => {
+  let autosaveInFlight: Promise<void> | null = null;
+  const flushChat = async () => {
     if (!chatDirty) return;
-    try {
-      await upsertChat(ctx.chat);
-      chatDirty = false;
-    } catch {
-      // best effort autosave
-    }
+    if (autosaveInFlight) return autosaveInFlight;
+    autosaveInFlight = (async () => {
+      try {
+        await upsertChat(ctx.chat);
+        chatDirty = false;
+      } catch {
+        // best effort autosave
+      } finally {
+        autosaveInFlight = null;
+      }
+    })();
+    return autosaveInFlight;
+  };
+  const autosaveTimer = setInterval(async () => {
+    await flushChat();
   }, 4000);
 
   renderHeader(ctx.state);
@@ -208,6 +219,10 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       .replace(/\s+/g, " ")
       .trim();
     if (!input) continue;
+    const now = Date.now();
+    if (input === lastSubmittedInput && now - lastSubmittedAt < 450) continue;
+    lastSubmittedInput = input;
+    lastSubmittedAt = now;
     if (await processInput(input)) break;
   }
 
@@ -315,13 +330,8 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   stopShiftTabToggle();
   stopPageUpHistory();
   clearInterval(autosaveTimer);
-  if (chatDirty) {
-    try {
-      await upsertChat(ctx.chat);
-    } catch {
-      // best effort final save
-    }
-  }
+  if (autosaveInFlight) await Promise.race([autosaveInFlight, sleepMs(1200)]);
+  if (chatDirty) await Promise.race([flushChat(), sleepMs(1200)]);
   console.log(`to resume this chat use: forge resume ${ctx.chat.name}`);
 }
 
@@ -346,7 +356,7 @@ function createSpinner(initialLabel: string): {
   const draw = () => {
     if (!active || paused) return;
     const f = frames[i++ % frames.length];
-    process.stdout.write(`\r${C.yellow}${f}${C.reset} ${C.dim}${label}${C.reset}`);
+    process.stdout.write(`\r\x1b[2K${C.yellow}${f}${C.reset} ${C.dim}${label}${C.reset}`);
   };
 
   return {
@@ -616,24 +626,6 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
     return false;
   }
 
-  if (cmd === "/autocontinue") {
-    const raw = (args[0] || "").trim();
-    if (!raw) {
-      console.log(`autocontinue=${ctx.state.autoContinueMax ?? 20}`);
-      console.log("usage: /autocontinue <1-120>");
-      return false;
-    }
-    const n = Number(raw);
-    if (!Number.isFinite(n) || n < 1 || n > 120) {
-      console.log("usage: /autocontinue <1-120>");
-      return false;
-    }
-    ctx.state = { ...ctx.state, autoContinueMax: Math.floor(n) };
-    await saveState(ctx.state);
-    console.log(`autocontinue=${ctx.state.autoContinueMax}`);
-    return false;
-  }
-
   if (cmd === "/objective") {
     if (!args.length || args[0] === "show") {
       console.log(ctx.workspace.objective.text || "(objective not set)");
@@ -819,9 +811,6 @@ function completeLine(line: string, ctx: ChatContext): [string[], string] {
   if (trimmed === "/searchmode" || trimmed === "/searchmode ") {
     return [["safe", "manual"], ""];
   }
-  if (trimmed === "/autocontinue" || trimmed === "/autocontinue ") {
-    return [["20", "40", "60", "120"], ""];
-  }
   if (trimmed === "/memory" || trimmed === "/memory ") {
     return [["show", "clear"], ""];
   }
@@ -867,9 +856,6 @@ function completeLine(line: string, ctx: ChatContext): [string[], string] {
   if (tokens[0] === "/searchmode" && tokens.length === 2) {
     return [["safe", "manual"].filter((v) => v.startsWith(current)), current];
   }
-  if (tokens[0] === "/autocontinue" && tokens.length === 2) {
-    return [["20", "40", "60", "120"].filter((v) => v.startsWith(current)), current];
-  }
 
   return [[], current];
 }
@@ -879,17 +865,28 @@ function enableLiveSuggestions(rl: readline.Interface, ctx: ChatContext, getProm
   if (!input.isTTY) return () => {};
 
   readline.emitKeypressEvents(input);
+  let lastGhostLen = 0;
+
+  const drawWithGhost = (line: string, suffix: string) => {
+    const prompt = getPromptPrefix();
+    process.stdout.write("\r\x1b[2K");
+    if (suffix) {
+      process.stdout.write(`${prompt}${line}\x1b[90m${suffix}\x1b[0m`);
+      process.stdout.write(`\x1b[${suffix.length}D`);
+      lastGhostLen = suffix.length;
+      return;
+    }
+    process.stdout.write(`${prompt}${line}`);
+    if (lastGhostLen > 0) lastGhostLen = 0;
+  };
 
   const onKeypress = (_str: string, key: { name?: string }) => {
     const line = rl.line || "";
     const trimmed = line.trimStart();
-    if (!trimmed.startsWith("/")) return;
-
-    const suffix = ghostSuffix(line, trimmed, ctx);
-    if (!suffix) return;
+    const suffix = trimmed.startsWith("/") ? ghostSuffix(line, trimmed, ctx) : "";
 
     // Accept suggestion using Right Arrow or End key.
-    if (key?.name === "right" || key?.name === "end") {
+    if (suffix && (key?.name === "right" || key?.name === "end")) {
       const cursor = (rl as any).cursor ?? line.length;
       if (cursor >= line.length) {
         rl.write(suffix);
@@ -897,21 +894,33 @@ function enableLiveSuggestions(rl: readline.Interface, ctx: ChatContext, getProm
       }
     }
 
-    process.stdout.write(`\r${getPromptPrefix()}${line}\x1b[90m${suffix}\x1b[0m`);
-    process.stdout.write(`\x1b[${suffix.length}D`);
+    drawWithGhost(line, suffix);
   };
 
   input.on("keypress", onKeypress);
   return () => input.off("keypress", onKeypress);
 }
 
-function enableEscAbort(onAbort: () => void): () => void {
+function enableEscAbort(onAbort: () => void, isAbortArmed: () => boolean): () => void {
   const input = process.stdin;
   if (!input.isTTY) return () => {};
 
   readline.emitKeypressEvents(input);
-  const onKeypress = (_str: string, key: { name?: string; sequence?: string }) => {
-    if (key?.name === "escape" || key?.sequence === "\u001b") onAbort();
+  let lastEscAt = 0;
+  const onKeypress = (_str: string, key: { name?: string }) => {
+    if (key?.name !== "escape") return;
+    if (isAbortArmed()) {
+      lastEscAt = 0;
+      onAbort();
+      return;
+    }
+    const now = Date.now();
+    if (now - lastEscAt < 650) {
+      lastEscAt = 0;
+      onAbort();
+      return;
+    }
+    lastEscAt = now;
   };
 
   input.on("keypress", onKeypress);
@@ -1102,7 +1111,7 @@ function renderHeader(state: ForgeState): void {
   const inner = width - 4;
   const lines = [
     "Cognautic Forge Interactive Chat",
-    `provider=${state.provider.provider} model=${state.provider.model} mode=${state.executionMode || "safe"} searchmode=${state.searchMode || "safe"} autocontinue=${state.autoContinueMax ?? 20}`,
+    `provider=${state.provider.provider} model=${state.provider.model} mode=${state.executionMode || "safe"} searchmode=${state.searchMode || "safe"}`,
     `root=${state.projectRoot}`,
     "Type /help for commands. Press Right/End for ghost autocomplete.",
     `Discord: ${C.blue}${C.underline}https://discord.gg/QrfpWDuZqd${C.reset}`,
@@ -1135,7 +1144,6 @@ function printStatus(state: ForgeState, modelCount: number): void {
     provider: state.provider,
     executionMode: state.executionMode || "safe",
     searchMode: state.searchMode || "safe",
-    autoContinueMax: state.autoContinueMax ?? 20,
     browserExecutablePath: state.browserExecutablePath || null,
     projectRoot: state.projectRoot,
     modelSuggestions: modelCount
@@ -1157,7 +1165,6 @@ function printHelp(): void {
     "/endpoint <url> (for custom provider)",
     "/browserpath </usr/sbin/brave>",
     "/searchmode <safe|manual>",
-    "/autocontinue <1-120>",
     "/config (interactive selectable setup)",
     "/mode <safe|yolo>",
     "/yolo [on|off|toggle] (shortcut: Ctrl+Y)",
@@ -1197,7 +1204,6 @@ async function runConfigWizard(rl: readline.Interface, ctx: ChatContext): Promis
       },
       { name: "browserpath", message: `Browser path    : ${working.browserExecutablePath || "(default playwright chromium)"}` },
       { name: "searchmode", message: `Search mode     : ${working.searchMode || "safe"}` },
-      { name: "autocontinue", message: `Auto-continue   : ${working.autoContinueMax ?? 20}` },
       { name: "projectroot", message: `Project root    : ${working.projectRoot}` },
       { name: "execmode", message: `Execution mode  : ${working.executionMode || "safe"}` },
       { name: "save", message: "Save and exit" },
@@ -1312,13 +1318,6 @@ async function runConfigWizard(rl: readline.Interface, ctx: ChatContext): Promis
       continue;
     }
 
-    if (pick === "autocontinue") {
-      const autoContinueInput = await enqInput(rl, enquirer, "Auto-continue max steps [1-120]", String(working.autoContinueMax ?? 20));
-      const n = Number(autoContinueInput);
-      if (Number.isFinite(n) && n >= 1 && n <= 120) working = { ...working, autoContinueMax: Math.floor(n) };
-      continue;
-    }
-
     if (pick === "projectroot") {
       const rootInput = await enqInput(rl, enquirer, "Project root", working.projectRoot);
       if (rootInput) working = { ...working, projectRoot: rootInput };
@@ -1352,9 +1351,8 @@ async function runConfigWizardFallback(rl: readline.Interface, ctx: ChatContext)
       `4) Endpoint        : ${working.provider.endpoint || (working.provider.provider === "ollama" ? "http://127.0.0.1:11434" : "(none)")}`,
       `5) Browser path    : ${working.browserExecutablePath || "(default playwright chromium)"}`,
       `6) Search mode     : ${working.searchMode || "safe"}`,
-      `7) Auto-continue   : ${working.autoContinueMax ?? 20}`,
-      `8) Project root    : ${working.projectRoot}`,
-      `9) Execution mode  : ${working.executionMode || "safe"}`,
+      `7) Project root    : ${working.projectRoot}`,
+      `8) Execution mode  : ${working.executionMode || "safe"}`,
       "s) Save and exit",
       "q) Cancel"
     ].join("\n"));
@@ -1406,17 +1404,11 @@ async function runConfigWizardFallback(rl: readline.Interface, ctx: ChatContext)
       continue;
     }
     if (pick === "7") {
-      const autoContinueInput = (await question(rl, "Auto-continue [1-120]: ")).trim();
-      const n = Number(autoContinueInput);
-      if (Number.isFinite(n) && n >= 1 && n <= 120) working = { ...working, autoContinueMax: Math.floor(n) };
-      continue;
-    }
-    if (pick === "8") {
       const rootInput = (await question(rl, `Project root (${working.projectRoot}): `)).trim();
       if (rootInput) working = { ...working, projectRoot: rootInput };
       continue;
     }
-    if (pick === "9") {
+    if (pick === "8") {
       const modeInput = (await question(rl, "Execution mode [safe/yolo]: ")).trim().toLowerCase();
       if (modeInput === "safe" || modeInput === "yolo") working = { ...working, executionMode: modeInput };
     }
@@ -1567,6 +1559,10 @@ function pickImageMime(types: string): string | null {
     if (lines.includes(mime)) return mime;
   }
   return null;
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function runCmdCollectStdout(command: string, args: string[], stdinText: string | null): Promise<Buffer> {

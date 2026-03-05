@@ -1,5 +1,6 @@
 export type ProviderKind =
   | "openai"
+  | "nim"
   | "google"
   | "anthropic"
   | "openrouter"

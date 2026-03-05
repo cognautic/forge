@@ -32,6 +32,16 @@ export async function launchBrowser(
   }
 }
 
+export async function resetBrowser(): Promise<void> {
+  try {
+    await context?.close();
+  } catch {
+    // best effort reset
+  }
+  context = null;
+  page = null;
+}
+
 async function launchContextOrThrow(userDataDir: string, executablePath?: string): Promise<BrowserContext> {
   try {
     return await chromium.launchPersistentContext(userDataDir, {
@@ -117,6 +127,13 @@ export async function evaluate(script: string): Promise<unknown> {
 export async function searchGoogle(query: string): Promise<void> {
   const p = await getPage();
   const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+  await p.goto(url, { waitUntil: "domcontentloaded" });
+  if (overlayEnabled) await ensureOverlay();
+}
+
+export async function searchDuckDuckGo(query: string): Promise<void> {
+  const p = await getPage();
+  const url = `https://duckduckgo.com/?q=${encodeURIComponent(query)}`;
   await p.goto(url, { waitUntil: "domcontentloaded" });
   if (overlayEnabled) await ensureOverlay();
 }

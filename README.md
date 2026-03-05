@@ -54,6 +54,7 @@ Do not use `bun build --compile` for Forge distribution because runtime modules 
 ## Provider Support
 
 - OpenAI
+- NVIDIA NIM
 - Google
 - Anthropic
 - OpenRouter

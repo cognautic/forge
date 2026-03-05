@@ -2,6 +2,7 @@ import type { ForgeState, ProviderConfig, ProviderKind } from "../types";
 
 export const PROVIDERS: ProviderKind[] = [
   "openai",
+  "nim",
   "google",
   "anthropic",
   "openrouter",
@@ -35,6 +36,13 @@ export async function fetchModels(state: ForgeState, provider: ProviderKind): Pr
   const key = provider === "ollama" ? "" : getApiKeyFromConfig(state, provider);
   if (provider === "openai") {
     const json = await getJson("https://api.openai.com/v1/models", {
+      Authorization: `Bearer ${key}`
+    });
+    return normalizeIds(json.data?.map((m: { id: string }) => m.id) || []);
+  }
+
+  if (provider === "nim") {
+    const json = await getJson("https://integrate.api.nvidia.com/v1/models", {
       Authorization: `Bearer ${key}`
     });
     return normalizeIds(json.data?.map((m: { id: string }) => m.id) || []);

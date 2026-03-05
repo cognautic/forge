@@ -10,7 +10,14 @@ export async function streamCompletion(
   const p = state.provider;
   const key = p.provider === "ollama" ? "" : getApiKeyFromConfig(state, p.provider);
 
-  if (p.provider === "openai" || p.provider === "openrouter" || p.provider === "groq" || p.provider === "cerebras" || p.provider === "custom") {
+  if (
+    p.provider === "openai" ||
+    p.provider === "nim" ||
+    p.provider === "openrouter" ||
+    p.provider === "groq" ||
+    p.provider === "cerebras" ||
+    p.provider === "custom"
+  ) {
     const url = resolveOpenAICompatUrl(state);
     await streamOpenAICompat(url, key, p.model, prompt, onChunk, signal);
     return;
@@ -97,7 +104,14 @@ export async function completeText(state: ForgeState, prompt: string, signal?: A
   const p = state.provider;
   const key = p.provider === "ollama" ? "" : getApiKeyFromConfig(state, p.provider);
 
-  if (p.provider === "openai" || p.provider === "openrouter" || p.provider === "groq" || p.provider === "cerebras" || p.provider === "custom") {
+  if (
+    p.provider === "openai" ||
+    p.provider === "nim" ||
+    p.provider === "openrouter" ||
+    p.provider === "groq" ||
+    p.provider === "cerebras" ||
+    p.provider === "custom"
+  ) {
     const url = resolveOpenAICompatUrl(state);
     const res = await fetch(url, {
       method: "POST",
@@ -172,6 +186,7 @@ export async function completeText(state: ForgeState, prompt: string, signal?: A
 function resolveOpenAICompatUrl(state: ForgeState): string {
   const provider = state.provider.provider;
   if (provider === "openai") return "https://api.openai.com/v1/chat/completions";
+  if (provider === "nim") return "https://integrate.api.nvidia.com/v1/chat/completions";
   if (provider === "openrouter") return "https://openrouter.ai/api/v1/chat/completions";
   if (provider === "groq") return "https://api.groq.com/openai/v1/chat/completions";
   if (provider === "cerebras") return "https://api.cerebras.ai/v1/chat/completions";
