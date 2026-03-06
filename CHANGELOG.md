@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.6 - 2026-03-06
+- Added startup npm registry update check with update-available banner in interactive chat.
+- Added visible planning workflow:
+  - new `plans.update` tool
+  - live plan output with `pending`, `in_progress`, `completed`
+  - completed steps rendered in grey
+- Fixed prompt cursor rendering while using left/right arrow with live suggestions.
+- Updated docs for NVIDIA NIM provider setup and usage in `README`.
+- Synced CLI help/docs with current slash commands (removed stale `/autocontinue` mention).
+
 ## 0.0.5 - 2026-03-06
 - Added visible planning support in chat:
   - new `plans.update` tool for structured step tracking

@@ -1,6 +1,6 @@
 import * as readline from "node:readline";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { CoworkRole, ForgeState, ProviderKind, TaskStatus } from "../types";
 import { saveState } from "../core/state";
@@ -44,6 +44,7 @@ type PasteMode = "idle" | "receiving_paste" | "staged_multiline";
 type PendingAttachment = { token: string; kind: "text" | "image"; text: string; mime?: string; bytes?: number };
 type PlanStatus = "pending" | "in_progress" | "completed";
 type UiPlanStep = { step: string; status: PlanStatus };
+type PackageMeta = { name: string; version: string };
 
 const COMMANDS = [
   "/help",
@@ -179,7 +180,9 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     await flushChat();
   }, 4000);
 
+  const updateInfo = await checkForNpmUpdate();
   renderHeader(ctx.state);
+  if (updateInfo) renderUpdateBanner(updateInfo.current, updateInfo.latest, updateInfo.name);
   if (resumed) {
     console.log(`resumed chat: id=${ctx.chat.id} name=${ctx.chat.name}`);
     if (ctx.chat.turns.length) {
@@ -520,12 +523,12 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
   if (cmd === "/model") {
     const model = args.join(" ").trim();
     if (!model) {
-      console.log("usage: /model <model-id>");
+      process.stdout.write(`\r\x1b[2Kusage: /model <model-id>\n`);
       return false;
     }
     ctx.state = setProvider(ctx.state, { ...ctx.state.provider, model });
     await saveState(ctx.state);
-    console.log(`model set: ${model}`);
+    process.stdout.write(`\r\x1b[2Kmodel set: ${model}\n`);
     return false;
   }
 
@@ -1178,6 +1181,65 @@ function printStatus(state: ForgeState, modelCount: number): void {
     projectRoot: state.projectRoot,
     modelSuggestions: modelCount
   }, null, 2));
+}
+
+async function checkForNpmUpdate(): Promise<{ name: string; current: string; latest: string } | null> {
+  try {
+    const meta = await readLocalPackageMeta();
+    if (!meta?.name || !meta?.version) return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2200);
+    let res: Response;
+    try {
+      const url = `https://registry.npmjs.org/${encodeURIComponent(meta.name)}`;
+      res = await fetch(url, { signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) return null;
+    const payload = (await res.json()) as any;
+    const latest = String(payload?.["dist-tags"]?.latest || "").trim();
+    if (!latest) return null;
+    if (compareSemver(latest, meta.version) <= 0) return null;
+    return { name: meta.name, current: meta.version, latest };
+  } catch {
+    return null;
+  }
+}
+
+async function readLocalPackageMeta(): Promise<PackageMeta | null> {
+  try {
+    const raw = await readFile(join(__dirname, "../../../package.json"), "utf8");
+    const pkg = JSON.parse(raw);
+    const name = String(pkg?.name || "").trim();
+    const version = String(pkg?.version || "").trim();
+    if (!name || !version) return null;
+    return { name, version };
+  } catch {
+    return null;
+  }
+}
+
+function compareSemver(a: string, b: string): number {
+  const pa = a.split("-")[0].split(".").map((x) => Number(x) || 0);
+  const pb = b.split("-")[0].split(".").map((x) => Number(x) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const da = pa[i] || 0;
+    const db = pb[i] || 0;
+    if (da > db) return 1;
+    if (da < db) return -1;
+  }
+  return 0;
+}
+
+function renderUpdateBanner(current: string, latest: string, pkg: string): void {
+  const line = `Update available: ${current} -> ${latest} (${pkg})`;
+  const cmd = `Run: npm i -g ${pkg}@latest`;
+  console.log(`${C.yellow}┌${"─".repeat(Math.max(line.length, cmd.length) + 2)}┐${C.reset}`);
+  console.log(`${C.yellow}│${C.reset} ${line.padEnd(Math.max(line.length, cmd.length))} ${C.yellow}│${C.reset}`);
+  console.log(`${C.yellow}│${C.reset} ${cmd.padEnd(Math.max(line.length, cmd.length))} ${C.yellow}│${C.reset}`);
+  console.log(`${C.yellow}└${"─".repeat(Math.max(line.length, cmd.length) + 2)}┘${C.reset}`);
 }
 
 function printHelp(): void {

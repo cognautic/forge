@@ -65,6 +65,31 @@ Do not use `bun build --compile` for Forge distribution because runtime modules 
 
 Model lists can be fetched from provider APIs and are used for command suggestions.
 
+### NVIDIA NIM
+
+Forge supports NVIDIA NIM through the `nim` provider.
+
+Setup in chat:
+
+```bash
+/provider nim
+/apikey nim <YOUR_NVIDIA_NIM_API_KEY>
+/models refresh
+/model <nim-model-id>
+```
+
+Setup with CLI commands:
+
+```bash
+forge provider set nim <nim-model-id>
+forge provider key set nim <YOUR_NVIDIA_NIM_API_KEY>
+forge provider models nim
+```
+
+Notes:
+- Default NIM endpoint used by Forge: `https://integrate.api.nvidia.com/v1/chat/completions`
+- Model list source: `https://integrate.api.nvidia.com/v1/models`
+
 ## Interactive Slash Commands
 
 General:
@@ -93,7 +118,6 @@ Runtime / environment:
 - `/root <path>`
 - `/browserpath </path/to/chrome-or-brave>`
 - `/searchmode <safe|manual>`
-- `/autocontinue <1-120>`
 
 Co-worker workspace:
 
@@ -180,6 +204,7 @@ Workspace / OS:
 - `system.exec`
 - `exec.run`
 - `exec.direct`
+- `plans.update`
 
 Finalization:
 
@@ -224,6 +249,7 @@ forge workspace task set <taskId> approved
   - `safe`: every tool action requires user confirmation.
   - `yolo`: all tool actions auto-execute with no confirmation prompts.
 - The agent is instructed to use Google for search/research workflows.
+- The agent prefers no-browser web tools first (`web.search`, `web.read`) and uses browser tools as fallback.
 - Search safety modes:
   - `safe`: attempts Google search, detects captcha/challenge pages, then falls back to user-assisted flow.
   - `manual`: opens Google and asks user to perform search/clicks manually, then agent reads DOM and summarizes.

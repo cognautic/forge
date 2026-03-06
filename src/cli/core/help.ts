@@ -19,7 +19,6 @@ Slash Commands in Chat:
   /apikey <provider> <key>
   /endpoint <url>
   /searchmode <safe|manual>
-  /autocontinue <1-120>
   /mode <safe|yolo>
   /yolo [on|off|toggle]
   /root <path>
