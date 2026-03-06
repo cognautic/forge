@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.0.5 - 2026-03-05
+## 0.0.5 - 2026-03-06
+- Added visible planning support in chat:
+  - new `plans.update` tool for structured step tracking
+  - live plan rendering in CLI with statuses (`pending`, `in_progress`, `completed`)
+  - completed plan steps are greyed out
+- Improved agent planning behavior:
+  - system guidance now instructs plan-first execution for non-trivial tasks
+  - plan updates can be emitted during execution before `finish_response`
+- Fixed prompt cursor rendering bug with live suggestions:
+  - left/right arrow cursor movement now renders at the correct visual position
+
+## 0.0.4 - 2026-03-05
 - Improved no-browser web search reliability:
   - `web.search` now uses DuckDuckGo free API first, then falls back to both HTML and lite result pages.
   - Expanded DuckDuckGo result parsing patterns to capture more result link formats.
@@ -9,7 +20,7 @@
   - removed `/autocontinue` command
   - removed auto-continue from config wizard, status header, help, and autocomplete
 
-## 0.0.4 - 2026-03-05
+## 0.0.3 - 2026-03-05
 - Added no-browser web tools:
   - `web.search` (DuckDuckGo free API with HTML fallback)
   - `web.read` (fetch + text extraction from URLs)

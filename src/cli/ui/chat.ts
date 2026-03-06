@@ -42,6 +42,8 @@ interface ChatContext {
 
 type PasteMode = "idle" | "receiving_paste" | "staged_multiline";
 type PendingAttachment = { token: string; kind: "text" | "image"; text: string; mime?: string; bytes?: number };
+type PlanStatus = "pending" | "in_progress" | "completed";
+type UiPlanStep = { step: string; status: PlanStatus };
 
 const COMMANDS = [
   "/help",
@@ -94,6 +96,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   let imagePasteBusy = false;
   let lastSubmittedInput = "";
   let lastSubmittedAt = 0;
+  let currentPlan: { explanation?: string; steps: UiPlanStep[] } | null = null;
   const onImagePasteKey = async (_str: string, key: { name?: string; ctrl?: boolean }) => {
     if (!key?.ctrl || key.name !== "v") return;
     if (imagePasteBusy || !process.stdin.isTTY) return;
@@ -298,6 +301,12 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
             spinner.pause();
             process.stdout.write(`${C.gray}    > ${compactLine(resultPreview)}${C.reset}\n`);
             spinner.resume();
+          },
+          onPlanUpdate: (plan) => {
+            currentPlan = { explanation: plan.explanation, steps: plan.steps };
+            spinner.pause();
+            renderPlan(currentPlan);
+            spinner.resume();
           }
         });
         spinner.stop();
@@ -399,6 +408,24 @@ function compactLine(input: string): string {
   const oneLine = String(input || "").replace(/\s+/g, " ").trim();
   if (!oneLine) return "(ok)";
   return oneLine.length > 220 ? `${oneLine.slice(0, 220)}...` : oneLine;
+}
+
+function renderPlan(plan: { explanation?: string; steps: UiPlanStep[] }): void {
+  process.stdout.write(`${C.blue}plan>${C.reset}\n`);
+  if (plan.explanation) process.stdout.write(`${C.gray}  ${compactLine(plan.explanation)}${C.reset}\n`);
+  for (let i = 0; i < plan.steps.length; i++) {
+    const item = plan.steps[i];
+    const n = `${i + 1}.`;
+    if (item.status === "completed") {
+      process.stdout.write(`${C.gray}  ${n} [x] ${item.step}${C.reset}\n`);
+      continue;
+    }
+    if (item.status === "in_progress") {
+      process.stdout.write(`  ${n} ${C.cyan}[>]${C.reset} ${item.step}\n`);
+      continue;
+    }
+    process.stdout.write(`  ${n} [ ] ${item.step}\n`);
+  }
 }
 
 async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interface): Promise<boolean> {
@@ -869,14 +896,17 @@ function enableLiveSuggestions(rl: readline.Interface, ctx: ChatContext, getProm
 
   const drawWithGhost = (line: string, suffix: string) => {
     const prompt = getPromptPrefix();
+    const cursor = Math.max(0, Math.min((rl as any).cursor ?? line.length, line.length));
+    const moveLeft = (line.length - cursor) + (suffix ? suffix.length : 0);
     process.stdout.write("\r\x1b[2K");
     if (suffix) {
       process.stdout.write(`${prompt}${line}\x1b[90m${suffix}\x1b[0m`);
-      process.stdout.write(`\x1b[${suffix.length}D`);
+      if (moveLeft > 0) process.stdout.write(`\x1b[${moveLeft}D`);
       lastGhostLen = suffix.length;
       return;
     }
     process.stdout.write(`${prompt}${line}`);
+    if (moveLeft > 0) process.stdout.write(`\x1b[${moveLeft}D`);
     if (lastGhostLen > 0) lastGhostLen = 0;
   };
 

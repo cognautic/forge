@@ -25,6 +25,8 @@ import { systemKeyboardType, systemMouseClick, systemMouseMove, systemOcr, syste
 
 type ToolCall = { type: "tool"; tool: string; args?: Record<string, unknown> };
 type Msg = { type: "message"; content: string };
+type PlanStatus = "pending" | "in_progress" | "completed";
+type PlanStep = { step: string; status: PlanStatus };
 let lastWebSearchAt = 0;
 
 export async function runAiTurn(
@@ -38,6 +40,7 @@ export async function runAiTurn(
     onStatus?: (status: string) => void;
     onToolCall?: (tool: string, args: Record<string, unknown>) => void;
     onToolResult?: (tool: string, resultPreview: string) => void;
+    onPlanUpdate?: (update: { explanation?: string; steps: PlanStep[] }) => void;
   }
 ): Promise<string> {
   const signal = opts?.signal;
@@ -80,7 +83,10 @@ export async function runAiTurn(
     "{\"type\":\"message\",\"content\":\"...\"}",
     "or",
     "{\"type\":\"tool\",\"tool\":\"web.search\",\"args\":{\"query\":\"...\"}}",
+    "or",
+    "{\"type\":\"tool\",\"tool\":\"plans.update\",\"args\":{\"explanation\":\"...\",\"steps\":[{\"step\":\"...\",\"status\":\"pending|in_progress|completed\"}]}}",
     "Available tools:",
+    "plans.update { explanation?, steps: [{ step, status }] }",
     "browser.launch { }",
     "browser.goto { url }",
     "browser.search { query }",
@@ -135,6 +141,7 @@ export async function runAiTurn(
     "   d) then finish_response with findings",
     "5) ALWAYS end with finish_response { content } when done.",
     "6) finish_response content MUST be a human-readable summary of what you did and what happened.",
+    "7) For non-trivial tasks, start by calling plans.update with a short step list, then keep updating statuses as you complete steps.",
     "",
     "COMMON COMMAND RECIPES:",
     "- List files: exec.direct program='ls' args=['-la']",
@@ -198,6 +205,18 @@ export async function runAiTurn(
         continue;
       }
       return content || "Action completed.";
+    }
+    if (parsed.tool === "plans.update") {
+      const plan = parsePlanUpdateArgs(parsed.args || {});
+      if (!plan) {
+        context += "\nTool result: plans.update rejected (invalid steps). Provide non-empty steps with statuses pending|in_progress|completed.\n";
+        continue;
+      }
+      if (!signal?.aborted) opts?.onToolCall?.(parsed.tool, parsed.args || {});
+      if (!signal?.aborted) opts?.onPlanUpdate?.(plan);
+      if (!signal?.aborted) opts?.onToolResult?.(parsed.tool, `updated ${plan.steps.length} steps`);
+      context += `\nTool call ${i + 1}: ${JSON.stringify(parsed)}\nTool result ${i + 1}: plan updated (${plan.steps.length} steps)\n`;
+      continue;
     }
 
     if ((state.executionMode || "safe") !== "yolo" && opts?.confirmAction) {
@@ -917,6 +936,22 @@ function hostTitle(url: string): string {
   } catch {
     return "result";
   }
+}
+
+function parsePlanUpdateArgs(args: Record<string, unknown>): { explanation?: string; steps: PlanStep[] } | null {
+  const rawSteps = Array.isArray(args.steps) ? args.steps : [];
+  const steps: PlanStep[] = [];
+  for (const item of rawSteps) {
+    if (!item || typeof item !== "object") continue;
+    const step = String((item as any).step || "").trim();
+    const status = String((item as any).status || "").trim() as PlanStatus;
+    if (!step) continue;
+    if (status !== "pending" && status !== "in_progress" && status !== "completed") continue;
+    steps.push({ step, status });
+  }
+  if (!steps.length) return null;
+  const explanation = String(args.explanation || "").trim();
+  return explanation ? { explanation, steps } : { steps };
 }
 
 async function waitForWebSearchSlot(): Promise<void> {
