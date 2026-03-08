@@ -100,6 +100,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   let pendingAttachments: PendingAttachment[] = [];
   let pendingImagePastes: Array<{ path: string; mime: string; bytes: number }> = [];
   let imagePasteBusy = false;
+  let modalPromptActive = false;
   let lastSubmittedInput = "";
   let lastSubmittedAt = 0;
   let currentPlan: { explanation?: string; steps: UiPlanStep[] } | null = null;
@@ -114,7 +115,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       const token = `[pasted image ${basename(pasted.path)}]`;
       pendingAttachments.push({ token, kind: "image", text: pasted.path, mime: pasted.mime, bytes: pasted.bytes });
       insertPlaceholderToken(rl, token, promptPrefix());
-      redrawPrompt(rl, promptPrefix());
+      if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
     } finally {
       imagePasteBusy = false;
     }
@@ -157,12 +158,12 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     };
     await saveState(ctx.state);
     process.stdout.write(`\nmode=${ctx.state.executionMode} (toggled via Ctrl+Y)\n`);
-    redrawPrompt(rl, promptPrefix());
+    if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
   });
   const stopShiftTabToggle = enableShiftTabToggle(() => {
     shellMode = !shellMode;
     process.stdout.write(`\ninput-mode=${shellMode ? "shell" : "chat"} (toggled via Shift+Tab)\n`);
-    redrawPrompt(rl, promptPrefix());
+    if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
   });
   const stopPageUpHistory = enablePageUpHistory(rl);
   let autosaveInFlight: Promise<void> | null = null;
@@ -297,9 +298,16 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
           confirmAction: async (tool, args) => {
             if ((ctx.state.executionMode || "safe") === "yolo") return true;
             spinner.pause();
+            modalPromptActive = true;
+            (rl as any).__forgeModalPromptActive = true;
             const ans = (await question(rl, `${C.yellow}confirm${C.reset} ${tool} ${JSON.stringify(args)} ? [y/N]: `))
               .trim()
               .toLowerCase();
+            modalPromptActive = false;
+            (rl as any).__forgeModalPromptActive = false;
+            if (process.stdout.isTTY) {
+              process.stdout.write("\r\x1b[2K");
+            }
             spinner.resume();
             return ans === "y" || ans === "yes";
           },
@@ -331,7 +339,14 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
             process.stdout.write(
               `${C.yellow}wait>${C.reset} ${C.white}${reason}${C.reset}${C.gray}${timeoutHint}${C.reset}\n`
             );
+            modalPromptActive = true;
+            (rl as any).__forgeModalPromptActive = true;
             const answer = (await question(rl, `${C.yellow}wait>${C.reset} ${label} `)).trim();
+            modalPromptActive = false;
+            (rl as any).__forgeModalPromptActive = false;
+            if (process.stdout.isTTY) {
+              process.stdout.write("\r\x1b[2K");
+            }
             spinner.resume();
             if (/^(cancel|stop|abort)$/i.test(answer)) {
               return `user did not complete manual step: ${reason}`;
@@ -1065,6 +1080,7 @@ function enableLiveSuggestions(rl: readline.Interface, ctx: ChatContext, getProm
   };
 
   const onKeypress = (_str: string, key: { name?: string }) => {
+    if ((rl as any).__forgeModalPromptActive) return;
     const line = rl.line || "";
     const trimmed = line.trimStart();
     const suffix = trimmed.startsWith("/") ? ghostSuffix(line, trimmed, ctx) : "";
@@ -1251,6 +1267,7 @@ function enablePasteIndicator(
 }
 
 function redrawPrompt(rl: readline.Interface, prompt = "you> "): void {
+  if ((rl as any).__forgeModalPromptActive) return;
   process.stdout.write(`\r\x1b[2K${prompt}${rl.line}`);
 }
 

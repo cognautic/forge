@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.11 - 2026-03-08
+- Fixed Google auth reuse so Forge no longer opens the Google login flow on every restart when saved tokens and scopes are still valid
+- Fixed modal prompt rendering so tool confirmations and `user.wait` no longer leak stray `you>` prompt lines like `you> y`
+- Updated `user.wait` system guidance so the model tells users to return to Forge and press Enter to continue after manual steps
+
 ## 0.0.10 - 2026-03-08
 - Fixed Google auth/session handling:
   - token files now live in Forge config storage instead of the current working directory

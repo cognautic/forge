@@ -96,9 +96,28 @@ export async function connectGoogle(
   scopes: string[]
 ): Promise<{ success: true; email: string } | { success: false; error: string }> {
   try {
+    const requiredScopes = [...new Set([...SCOPES.base, ...scopes])];
+    const existing = await loadTokens(userId);
+    const alreadyGranted = existing
+      ? requiredScopes.every((scope) => existing.grantedScopes.includes(scope))
+      : false;
+    if (existing && alreadyGranted) {
+      const client = await getAuthenticatedClient(userId);
+      if (client) {
+        try {
+          await client.getAccessToken();
+          const oauth2 = google.oauth2({ auth: client, version: "v2" });
+          const me = await oauth2.userinfo.get();
+          return { success: true, email: me.data.email || "unknown" };
+        } catch {
+          // Fall through to a fresh auth flow if stored auth is no longer usable.
+        }
+      }
+    }
+
     const handle = await startCallbackServer();
     const redirectUri = getRedirectUri(handle.port);
-    const authUrl = getServerAuthUrl(userId, scopes, redirectUri) || getAuthUrl(scopes, redirectUri);
+    const authUrl = getServerAuthUrl(userId, requiredScopes, redirectUri) || getAuthUrl(requiredScopes, redirectUri);
     await openUrl(authUrl);
     const code = await handle.waitForCode;
     const serverExchange = getServerExchangeUrl();
@@ -106,12 +125,12 @@ export async function connectGoogle(
       ? await exchangeCodeViaServer(code, redirectUri, userId)
       : await exchangeCodeLocally(code, redirectUri);
     const me = exchanged.email;
-    const existing = await loadTokens(userId);
-    const grantedScopes = [...new Set([...(existing?.grantedScopes || []), ...SCOPES.base, ...scopes])];
+    const latestStored = await loadTokens(userId);
+    const grantedScopes = [...new Set([...(latestStored?.grantedScopes || []), ...requiredScopes])];
     const merged = {
-      ...(existing?.tokens || {}),
+      ...(latestStored?.tokens || {}),
       ...exchanged.tokens,
-      refresh_token: exchanged.tokens.refresh_token || existing?.tokens.refresh_token
+      refresh_token: exchanged.tokens.refresh_token || latestStored?.tokens.refresh_token
     };
     await saveTokens(userId, merged, grantedScopes);
     return { success: true, email: me || "unknown" };
