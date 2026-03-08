@@ -124,6 +124,7 @@ export async function connectGoogle(
  * Logs out a Google user locally and optionally via a configured server endpoint.
  */
 export async function disconnectGoogle(userId: string): Promise<{ success: true } | { success: false; error: string }> {
+  let remoteError: string | null = null;
   try {
     const logoutUrl = process.env.CONVEX_GOOGLE_LOGOUT_URL || DEFAULT_CONVEX_GOOGLE_LOGOUT_URL;
     if (logoutUrl) {
@@ -133,12 +134,23 @@ export async function disconnectGoogle(userId: string): Promise<{ success: true 
         body: JSON.stringify({ userId })
       });
       if (!res.ok) {
-        throw new Error(`Server logout failed: HTTP ${res.status}`);
+        remoteError = `Server logout failed: HTTP ${res.status}`;
       }
     }
+  } catch (error) {
+    remoteError = formatError(error);
+  }
+
+  try {
     await deleteTokens(userId);
+    if (remoteError) {
+      return { success: false, error: `Local tokens deleted, but remote logout failed: ${remoteError}` };
+    }
     return { success: true };
   } catch (error) {
+    if (remoteError) {
+      return { success: false, error: `Remote logout failed: ${remoteError}; local cleanup also failed: ${formatError(error)}` };
+    }
     return { success: false, error: formatError(error) };
   }
 }

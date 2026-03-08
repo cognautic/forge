@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { arch, homedir, hostname, platform, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import type { Credentials } from "google-auth-library";
+import { configDir } from "../../../cli/core/state";
 
 interface StoredTokenEnvelope {
   iv: string;
@@ -23,7 +24,7 @@ export interface GoogleStoredTokens {
 }
 
 function getTokenPath(userId: string): string {
-  return join(process.cwd(), ".forge", "google-tokens", `${sanitizeUserId(userId)}.json`);
+  return join(configDir, "google-tokens", `${sanitizeUserId(userId)}.json`);
 }
 
 function sanitizeUserId(userId: string): string {

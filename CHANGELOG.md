@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.10 - 2026-03-08
+- Fixed Google auth/session handling:
+  - token files now live in Forge config storage instead of the current working directory
+  - `google.disconnect()` now deletes local tokens even if remote logout fails
+  - `GoogleIntegration.isConnected()` now validates a usable access token instead of only checking for a token file
+  - `forge auth google` and `/auth google` now request only base login scopes, keeping product scopes incremental
+- Fixed another prompt duplication edge case where `/exit` could echo a duplicate `you>` line during shutdown
+- Updated `user.wait` system guidance so the model tells users to return to Forge and press Enter to continue after manual steps
+
 ## 0.0.9 - 2026-03-08
 - Fixed Google auth token storage so Forge no longer requires `FORGE_ENCRYPTION_KEY` explicitly:
   - uses the env var when present

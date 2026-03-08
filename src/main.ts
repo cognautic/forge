@@ -157,7 +157,7 @@ async function main() {
 
   if (parsed.command === "auth" && parsed.subcommand === "google") {
     const google = new GoogleIntegration();
-    const result = await google.connect(getGoogleUserId(), ["gmail", "calendar", "drive", "docs", "sheets", "tasks", "contacts", "meet"]);
+    const result = await google.connect(getGoogleUserId());
     print(result.success ? `google connected: ${result.email}` : `google auth failed: ${result.error}`);
     return;
   }

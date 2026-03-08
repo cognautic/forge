@@ -234,7 +234,13 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     if (input === lastSubmittedInput && now - lastSubmittedAt < 450) continue;
     lastSubmittedInput = input;
     lastSubmittedAt = now;
-    if (await processInput(input)) break;
+    if (await processInput(input)) {
+      if (process.stdout.isTTY) {
+        process.stdout.write("\r\x1b[2K");
+      }
+      rl.pause();
+      break;
+    }
   }
 
   async function processInput(input: string): Promise<boolean> {
@@ -354,6 +360,9 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     return false;
   }
 
+  if (process.stdout.isTTY) {
+    process.stdout.write("\r\x1b[2K");
+  }
   rl.close();
   stopLiveSuggestions();
   stopPasteIndicator();
@@ -895,7 +904,7 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
     }
     console.log("opening Google login in your browser...");
     const google = new GoogleIntegration();
-    const result = await google.connect(getGoogleUserId(), ["gmail", "calendar", "drive", "docs", "sheets", "tasks", "contacts", "meet"]);
+    const result = await google.connect(getGoogleUserId());
     if (!result.success) {
       console.log(`google auth failed: ${result.error}`);
       return false;

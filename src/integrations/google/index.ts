@@ -1,5 +1,5 @@
 import { loadTokens } from "./auth/tokens";
-import { connectGoogle, disconnectGoogle } from "./auth/oauth";
+import { connectGoogle, disconnectGoogle, getAuthenticatedClient } from "./auth/oauth";
 import { getScopesForProducts, getScopesForTools, type GoogleProduct } from "./auth/scopes";
 import { executeTool, getAllTools, getToolSchemas, getToolsForProducts, type ToolExecutionResult } from "./registry";
 
@@ -25,7 +25,15 @@ export class GoogleIntegration {
    * Returns whether valid Google tokens exist for the user.
    */
   async isConnected(userId: string): Promise<boolean> {
-    return Boolean(await loadTokens(userId));
+    if (!await loadTokens(userId)) return false;
+    try {
+      const client = await getAuthenticatedClient(userId);
+      if (!client) return false;
+      const token = await client.getAccessToken();
+      return Boolean(token?.token);
+    } catch {
+      return false;
+    }
   }
 
   /**
