@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.9 - 2026-03-08
+- Fixed Google auth token storage so Forge no longer requires `FORGE_ENCRYPTION_KEY` explicitly:
+  - uses the env var when present
+  - falls back to a machine-local derived encryption key otherwise
+- Fixed chat shutdown output so the resume hint no longer inherits a stale `you>` prompt prefix
+- Added Forge footer legal links only on the Forge website page
+- Added Forge docs-style Terms of Service and Privacy Policy pages under the Forge website section
+- Restored the main website homepage after an accidental corruption in the website repo
+
 ## 0.0.7 - 2026-03-08
 - Added full Google Workspace integration:
   - Gmail, Calendar, Drive, Docs, Sheets, Tasks, Contacts, and Meet tools

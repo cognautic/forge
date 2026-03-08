@@ -52,7 +52,7 @@ Forge stores encrypted Google tokens in:
 .forge/google-tokens/{userId}.json
 ```
 
-Tokens are encrypted with AES-256-GCM using a key derived from `FORGE_ENCRYPTION_KEY` and machine-specific values.
+Tokens are encrypted with AES-256-GCM using a key derived from `FORGE_ENCRYPTION_KEY` when provided, or a machine-local fallback key when it is not.
 
 ## Adding the Integration to Forge
 

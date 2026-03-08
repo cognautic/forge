@@ -365,6 +365,9 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   clearInterval(autosaveTimer);
   if (autosaveInFlight) await Promise.race([autosaveInFlight, sleepMs(1200)]);
   if (chatDirty) await Promise.race([flushChat(), sleepMs(1200)]);
+  if (process.stdout.isTTY) {
+    process.stdout.write("\r\x1b[2K");
+  }
   console.log(`to resume this chat use: forge resume ${ctx.chat.name}`);
 }
 

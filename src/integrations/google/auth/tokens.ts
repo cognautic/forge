@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir, hostname, platform } from "node:os";
+import { arch, homedir, hostname, platform, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import type { Credentials } from "google-auth-library";
 
@@ -31,10 +31,14 @@ function sanitizeUserId(userId: string): string {
 }
 
 function getEncryptionKey(): Buffer {
-  const secret = process.env.FORGE_ENCRYPTION_KEY || "";
-  if (!secret) {
-    throw new Error("FORGE_ENCRYPTION_KEY is required for Google token encryption");
-  }
+  const secret = process.env.FORGE_ENCRYPTION_KEY || [
+    "forge-google-tokens",
+    hostname(),
+    homedir(),
+    platform(),
+    arch(),
+    userInfo().username
+  ].join("|");
   return createHash("sha256")
     .update([secret, hostname(), homedir(), platform()].join("|"))
     .digest();
