@@ -27,9 +27,14 @@ Slash Commands in Chat:
   /artifact <add|list> ...
   /timeline
   /roles [show] | /roles set <role> <owner>
+  /mcp <list|tools|add|remove> ...
+  /auth google
+  /logout google
   /rename <chat-name>
 
 CLI Commands:
+  forge -v
+  forge --version
   forge --reset
   forge reset
   forge state show
@@ -39,6 +44,11 @@ CLI Commands:
   forge provider set <provider> <model> [--endpoint URL]
   forge provider key set <provider> <api-key>
   forge provider models [provider]
+  forge mcp list
+  forge mcp add <name> <command> [args...]
+  forge mcp remove <name>
+  forge auth google
+  forge logout google
   forge chat <prompt>
   forge workspace show
   forge workspace objective <text>

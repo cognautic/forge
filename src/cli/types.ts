@@ -15,6 +15,13 @@ export interface ProviderConfig {
   endpoint?: string;
 }
 
+export interface McpServerConfig {
+  name: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
 export interface AgentRequest {
   task: string;
   maxSteps?: number;
@@ -36,6 +43,7 @@ export interface ForgeState {
   searchMode?: "safe" | "manual";
   provider: ProviderConfig;
   apiKeys: Partial<Record<ProviderKind, string>>;
+  mcpServers?: McpServerConfig[];
 }
 
 export type CoworkRole = "architect" | "planner" | "executor" | "reviewer" | "memory_manager";

@@ -7,6 +7,8 @@ Cognautic Forge is a local-first, interactive Node CLI agent with:
 - Browser automation (Playwright Chromium / custom executable)
 - File and command execution tools
 - System control tools (mouse/keyboard/screenshot/OCR)
+- Stdio MCP server support
+- Google Workspace tools via Forge auth
 - Persistent collaborative workspace (objective, tasks, artifacts, timeline, roles)
 
 ## Install (npm)
@@ -118,6 +120,8 @@ Runtime / environment:
 - `/root <path>`
 - `/browserpath </path/to/chrome-or-brave>`
 - `/searchmode <safe|manual>`
+- `/auth google`
+- `/logout google`
 
 Co-worker workspace:
 
@@ -175,6 +179,51 @@ The interactive AI turn uses a JSON tool-envelope protocol:
 
 ## Implemented Tool Surface
 
+Google Workspace:
+
+- `google.gmail_list_emails`
+- `google.gmail_read_email`
+- `google.gmail_send_email`
+- `google.gmail_create_draft`
+- `google.gmail_reply_email`
+- `google.gmail_search_emails`
+- `google.gmail_list_labels`
+- `google.gmail_move_email`
+- `google.calendar_list_events`
+- `google.calendar_create_event`
+- `google.calendar_update_event`
+- `google.calendar_delete_event`
+- `google.calendar_get_event`
+- `google.calendar_list_calendars`
+- `google.calendar_find_free_slots`
+- `google.drive_list_files`
+- `google.drive_search_files`
+- `google.drive_get_file`
+- `google.drive_upload_file`
+- `google.drive_create_folder`
+- `google.drive_delete_file`
+- `google.drive_move_file`
+- `google.drive_share_file`
+- `google.docs_create`
+- `google.docs_read`
+- `google.docs_append_text`
+- `google.docs_replace_text`
+- `google.sheets_create`
+- `google.sheets_read_range`
+- `google.sheets_write_range`
+- `google.sheets_append_row`
+- `google.sheets_get_all`
+- `google.tasks_list`
+- `google.tasks_create`
+- `google.tasks_complete`
+- `google.tasks_delete`
+- `google.tasks_list_tasklists`
+- `google.contacts_search`
+- `google.contacts_get`
+- `google.contacts_list`
+- `google.contacts_create`
+- `google.meet_create_meeting`
+
 Browser:
 
 - `browser.launch`
@@ -204,6 +253,7 @@ Workspace / OS:
 - `system.exec`
 - `exec.run`
 - `exec.direct`
+- `mcp.<server>.<tool>` for configured stdio MCP servers
 - `plans.update`
 
 Finalization:
@@ -222,7 +272,65 @@ forge provider show
 forge provider set openai gpt-4.1-mini
 forge provider key set openai sk-...
 forge provider models openai
+forge mcp list
+forge mcp add filesystem npx -y @modelcontextprotocol/server-filesystem .
+forge mcp remove filesystem
+forge auth google
+forge logout google
 ```
+
+## Google Login
+
+Users do not need to add Google client id or Google client secret locally.
+Forge uses the deployed Convex backend for Google OAuth, token exchange, logout, and refresh.
+
+Login:
+
+```bash
+forge auth google
+```
+
+Or inside chat:
+
+```text
+/auth google
+```
+
+Logout:
+
+```bash
+forge logout google
+```
+
+Or inside chat:
+
+```text
+/logout google
+```
+
+After login, Google tools are available directly in chat and agent turns for:
+
+- Gmail
+- Calendar
+- Drive
+- Docs
+- Sheets
+- Tasks
+- Contacts
+- Meet
+
+## MCP Servers
+
+Forge supports stdio MCP servers configured in app state.
+
+Examples:
+
+```bash
+forge mcp add filesystem npx -y @modelcontextprotocol/server-filesystem .
+forge mcp list
+```
+
+Configured MCP tools are exposed to the agent as `mcp.<server>.<tool>`.
 
 Chat:
 

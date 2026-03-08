@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.0.7 - 2026-03-08
+- Added full Google Workspace integration:
+  - Gmail, Calendar, Drive, Docs, Sheets, Tasks, Contacts, and Meet tools
+  - OpenAI-function-style Google tool registry wired into Forge agent execution as `google.*`
+- Added Google auth/logout flows:
+  - `forge auth google`
+  - `forge logout google`
+  - `/auth google`
+  - `/logout google`
+- Added server-backed Google OAuth with Convex:
+  - Convex dev and prod backend scaffolds
+  - production deploy wiring for Google auth, token exchange, logout, and refresh
+  - local Forge no longer needs `GOOGLE_CLIENT_ID` or `GOOGLE_CLIENT_SECRET`
+- Improved Google Calendar event creation:
+  - accepts both plain datetime strings and `{ dateTime/date, timeZone }` objects
+  - respects `calendarId`
+- Updated docs:
+  - Forge README
+  - Google integration README
+  - Convex README
+  - website Forge docs
+- Improved chat UX:
+  - restored spinner loader below `ai>` instead of inline `ai> thinking...`
+  - added current system date/time to the agent prompt
+  - updated agent policy to prefer direct API/tool paths over browser automation for Google/API-capable tasks
+
 ## 0.0.6 - 2026-03-06
 - Added startup npm registry update check with update-available banner in interactive chat.
 - Added visible planning workflow:

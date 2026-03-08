@@ -6,12 +6,14 @@ import {
   detectBotChallenge,
   evaluate,
   extract,
+  findTextPatterns,
   launchBrowser,
-  resetBrowser,
   moveAiCursor,
   navigate,
+  observeBrowserState,
   openGoogleHome,
   readDomText,
+  resetBrowser,
   scrollPage,
   searchDuckDuckGo,
   searchGoogle,
@@ -22,6 +24,8 @@ import {
 import { readWorkspaceFile, writeWorkspaceFile } from "../core/filesystem";
 import { runCommand, runCommandDirect } from "../terminal/exec";
 import { systemKeyboardType, systemMouseClick, systemMouseMove, systemOcr, systemScreenshot } from "../system/control";
+import { callMcpTool, listMcpTools } from "../mcp/client";
+import { executeTool as executeGoogleTool, getAllTools as getAllGoogleTools } from "../../integrations/google";
 
 type ToolCall = { type: "tool"; tool: string; args?: Record<string, unknown> };
 type Msg = { type: "message"; content: string };
@@ -41,8 +45,11 @@ export async function runAiTurn(
     onToolCall?: (tool: string, args: Record<string, unknown>) => void;
     onToolResult?: (tool: string, resultPreview: string) => void;
     onPlanUpdate?: (update: { explanation?: string; steps: PlanStep[] }) => void;
+    onUserWait?: (request: { reason: string; prompt?: string; timeoutSeconds?: number | null }) => Promise<string>;
   }
 ): Promise<string> {
+  const mcpTools = await listMcpTools(state);
+  const googleTools = getAllGoogleTools();
   const signal = opts?.signal;
   const workspaceContext = opts?.workspaceContext || "Workspace context unavailable.";
   const memoryContext = opts?.memoryContext || "Memory unavailable.";
@@ -63,8 +70,11 @@ export async function runAiTurn(
     xdgDesktop: process.env.XDG_CURRENT_DESKTOP || null,
     desktopSession: process.env.DESKTOP_SESSION || null
   };
+  const now = new Date();
   const system = [
     "You are Cognautic Forge AI with tool access.",
+    `Current system date/time: ${now.toString()}`,
+    `Current system ISO timestamp: ${now.toISOString()}`,
     `Execution mode: ${state.executionMode || "safe"} (safe=request confirmation before each action; yolo=auto-execute all actions).`,
     "Operate as a structured co-worker with internal roles: Architect -> Planner -> Executor -> Reviewer -> Memory Manager.",
     "Use memory context to continue prior work when user asks to continue/resume/finish.",
@@ -73,10 +83,21 @@ export async function runAiTurn(
     "Prefer deterministic execution over speculative autonomy.",
     "Always decide yourself whether to call tools.",
     "For search/research requests, prefer web.search + web.read (no browser). Use browser tools only as fallback.",
+    "Prefer direct tools and APIs over browser automation whenever a capable non-browser tool exists.",
+    "Do not use browser tools for automations, Google Workspace tasks, or API-capable workflows when Forge has a direct tool path.",
+    "If the user asks to do something in Gmail, Google Calendar, Drive, Docs, Sheets, Tasks, Contacts, or Meet, prefer google.* tools instead of browser automation.",
+    "Use browser tools only when there is no direct API/tool path, or when the user explicitly asks for browser/web-UI operation.",
+    "If a browser workflow is still required and reaches a step only the user can complete, use user.wait to pause the workflow and resume after the user confirms completion.",
+    "Browser tool results may include browser_notice entries when a popup appears, a new page opens, the URL/title changes, or the DOM changes. Use those notices to decide the next action.",
     "Never claim missing permissions. This runtime has tool access controlled by Forge.",
     "Do not ask the user to grant browser permissions. If browser actions fail, call tools to recover and report the concrete error.",
     `Search mode: ${state.searchMode || "safe"} (safe=try automation + fallback on challenge, manual=open Google and wait for user actions).`,
     "After search, read DOM text and if needed scroll/evaluate/click for more details before final answer.",
+    ...(state.mcpServers?.length ? [
+      `Configured MCP servers: ${state.mcpServers.map((server) => server.name).join(", ")}`,
+      "MCP tools are optional integrations. Use them when clearly suitable, but do not block on MCP if the task can be completed through the app's web UI."
+    ] : []),
+    "Google Workspace tools are available as google.* function tools after the user connects Google.",
     "Decide tool usage autonomously from user intent and tool results.",
     "Respond with EXACTLY ONE JSON object and nothing else.",
     "JSON schema:",
@@ -95,6 +116,7 @@ export async function runAiTurn(
     "browser.read_dom { limit }",
     "browser.scroll { pixels }",
     "browser.extract { selector }",
+    "browser.find_text { pattern, limit? }",
     "browser.click { selector }",
     "browser.eval { script }",
     "browser.overlay_on { }",
@@ -117,6 +139,17 @@ export async function runAiTurn(
     "files.write { path, content }",
     "exec.run { command }",
     "exec.direct { program, args }",
+    "mcp.list_tools { }",
+    "mcp.call { server, tool, arguments }",
+    "user.wait { reason, prompt?, timeout_seconds? }",
+    ...(googleTools.length
+      ? ["Google tools:", ...googleTools.map((tool) => `google.${tool.name} - ${tool.description}`)]
+      : []),
+    ...(mcpTools.length
+      ? ["MCP tools (configured servers):", ...mcpTools.map((tool) =>
+          `mcp.${tool.server}.${tool.name} ${tool.description ? `- ${tool.description}` : ""}`.trim()
+        )]
+      : []),
     "",
     "TOOL USAGE GUIDE (FOLLOW STRICTLY):",
     "SAFETY: Do NOT use rfkill. Use nmcli for network/Wi-Fi controls.",
@@ -139,9 +172,16 @@ export async function runAiTurn(
     "   b) web.read on relevant result URLs",
     "   c) use browser tools only as fallback",
     "   d) then finish_response with findings",
-    "5) ALWAYS end with finish_response { content } when done.",
-    "6) finish_response content MUST be a human-readable summary of what you did and what happened.",
-    "7) For non-trivial tasks, start by calling plans.update with a short step list, then keep updating statuses as you complete steps.",
+    "5) Use user.wait when the workflow depends on a manual user action that tools cannot complete.",
+    "   - Use it for: login, OAuth consent, captcha solving, 2FA, security prompts, account chooser, permissions approval, or a manual confirmation inside a site/app.",
+    "   - Good: after opening Google Calendar and reaching the Google sign-in page, call user.wait so the user can log in, then continue with browser.read_dom/browser.click/browser.eval.",
+    "   - Good: if Google search/manual web flow hits a captcha or anti-bot page, call user.wait and continue after the user resolves it.",
+    "   - Good: if a site requires a one-time manual approval or app authorization popup, call user.wait.",
+    "   - Do not use it for ordinary page loads or tool latency. Use normal browser/web tools for that.",
+    "   - Do not use it as a substitute for finish_response when the task is already complete.",
+    "6) ALWAYS end with finish_response { content } when done.",
+    "7) finish_response content MUST be a human-readable summary of what you did and what happened.",
+    "8) For non-trivial tasks, start by calling plans.update with a short step list, then keep updating statuses as you complete steps.",
     "",
     "COMMON COMMAND RECIPES:",
     "- List files: exec.direct program='ls' args=['-la']",
@@ -233,7 +273,7 @@ export async function runAiTurn(
     if (!signal?.aborted) opts?.onToolCall?.(parsed.tool, parsed.args || {});
     let toolResult = "";
     try {
-      toolResult = await executeTool(state, parsed);
+      toolResult = await executeTool(state, parsed, opts);
     } catch (err: any) {
       if (signal?.aborted || err?.name === "AbortError") throw err;
       const message = err instanceof Error ? err.message : String(err);
@@ -253,8 +293,54 @@ export async function runAiTurn(
 
 }
 
-async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
+async function executeTool(
+  state: ForgeState,
+  call: ToolCall,
+  opts?: {
+    onUserWait?: (request: { reason: string; prompt?: string; timeoutSeconds?: number | null }) => Promise<string>;
+  }
+): Promise<string> {
   const args = call.args || {};
+  if (call.tool === "user.wait") {
+    const reason = String(args.reason || "").trim();
+    const prompt = String(args.prompt || "").trim();
+    const timeoutRaw = Number(args.timeout_seconds);
+    const timeoutSeconds = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : null;
+    if (!reason) throw new Error("user.wait requires reason");
+    if (opts?.onUserWait) {
+      return await opts.onUserWait({
+        reason,
+        prompt: prompt || undefined,
+        timeoutSeconds
+      });
+    }
+    if (timeoutSeconds) {
+      await sleep(timeoutSeconds * 1000);
+      return `waited ${timeoutSeconds}s for manual user action: ${reason}`;
+    }
+    return `manual user action required: ${reason}`;
+  }
+  if (call.tool === "mcp.list_tools") {
+    return JSON.stringify(await listMcpTools(state));
+  }
+  if (call.tool === "mcp.call") {
+    const server = String(args.server || "").trim();
+    const tool = String(args.tool || "").trim();
+    if (!server || !tool) throw new Error("mcp.call requires server and tool");
+    const toolArgs = args.arguments && typeof args.arguments === "object" ? (args.arguments as Record<string, unknown>) : {};
+    return await callMcpTool(state, server, tool, toolArgs);
+  }
+  if (call.tool.startsWith("mcp.")) {
+    const [, serverName, ...toolParts] = call.tool.split(".");
+    const toolName = toolParts.join(".");
+    if (!serverName || !toolName) throw new Error(`invalid MCP tool name: ${call.tool}`);
+    return await callMcpTool(state, serverName, toolName, args);
+  }
+  if (call.tool.startsWith("google.")) {
+    const toolName = call.tool.slice("google.".length);
+    const result = await executeGoogleTool(toolName, args, getGoogleUserId());
+    return result.success ? JSON.stringify(result.data) : `google_error(${toolName}): ${result.error}`;
+  }
   if (call.tool.startsWith("browser.")) {
     return await executeBrowserToolWithRecovery(state, call.tool, args);
   }
@@ -308,6 +394,14 @@ async function executeTool(state: ForgeState, call: ToolCall): Promise<string> {
     await launchBrowser(".forge-data/browser", state.browserExecutablePath);
     const selector = String(args.selector || "body");
     return await extract(selector);
+  }
+
+  if (call.tool === "browser.find_text") {
+    await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+    const pattern = String(args.pattern || "").trim();
+    if (!pattern) throw new Error("browser.find_text requires pattern");
+    const limit = Number(args.limit || 10);
+    return await findTextPatterns(pattern, limit);
   }
 
   if (call.tool === "browser.click") {
@@ -598,6 +692,14 @@ async function executeBrowserToolWithRecovery(
       return await extract(selector);
     }
 
+    if (tool === "browser.find_text") {
+      await launchBrowser(".forge-data/browser", state.browserExecutablePath);
+      const pattern = String(args.pattern || "").trim();
+      if (!pattern) throw new Error("browser.find_text requires pattern");
+      const limit = Number(args.limit || 10);
+      return await findTextPatterns(pattern, limit);
+    }
+
     if (tool === "browser.click") {
       await launchBrowser(".forge-data/browser", state.browserExecutablePath);
       const selector = String(args.selector || "a");
@@ -662,15 +764,34 @@ async function executeBrowserToolWithRecovery(
   };
 
   try {
-    return await run();
+    const result = await run();
+    const notice = await observeBrowserState().catch(() => "");
+    return appendBrowserNotice(result, notice);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (!/has been closed|Target page, context or browser has been closed|context closed|browser closed/i.test(message)) {
       throw err;
     }
     await resetBrowser();
-    return await run();
+    const result = await run();
+    const notice = await observeBrowserState().catch(() => "");
+    return appendBrowserNotice(result, notice);
   }
+}
+
+function appendBrowserNotice(result: string, notice: string): string {
+  const clean = String(notice || "").trim();
+  if (!clean) return result;
+  return `${result}\n\nbrowser_notice: ${clean}`;
+}
+
+function getGoogleUserId(): string {
+  return (
+    process.env.FORGE_GOOGLE_USER_ID ||
+    process.env.USER ||
+    process.env.USERNAME ||
+    "default"
+  );
 }
 
 function parseModelOutput(raw: string): ToolCall | Msg | null {

@@ -1,5 +1,8 @@
 #!/usr/bin/env node
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { parseArgv } from "./cli/core/args";
+import { loadDotEnv } from "./cli/core/env";
 import { HELP } from "./cli/core/help";
 import { loadState, resetForgeState, saveState } from "./cli/core/state";
 import type { ProviderKind } from "./cli/types";
@@ -11,6 +14,7 @@ import { moveMouse, clickMouse, typeText, shortcut, emergencyStop } from "./cli/
 import { runAgent } from "./cli/agent/loop";
 import { streamCompletion } from "./cli/providers/client";
 import { runInteractiveChat } from "./cli/ui/chat";
+import { listMcpTools } from "./cli/mcp/client";
 import {
   addTask,
   loadWorkspace,
@@ -22,10 +26,17 @@ import {
   workspaceDigest
 } from "./cli/core/cowork";
 import { runAiTurn } from "./cli/agent/chatAgent";
+import { GoogleIntegration } from "./integrations/google";
 
 async function main() {
+  loadDotEnv();
   const args = process.argv.slice(2);
   const print = (value: unknown) => console.log(typeof value === "string" ? value : JSON.stringify(value, null, 2));
+
+  if (args.includes("-v") || args.includes("--version")) {
+    print(await readVersion());
+    return;
+  }
 
   if (args.includes("--reset")) {
     await resetForgeState();
@@ -114,6 +125,51 @@ async function main() {
   if (parsed.command === "provider" && parsed.subcommand === "models") {
     const provider = (parsed.rest[0] as ProviderKind | undefined) || state.provider.provider;
     print(await fetchModels(state, provider));
+    return;
+  }
+
+  if (parsed.command === "mcp" && parsed.subcommand === "list") {
+    print({
+      servers: state.mcpServers || [],
+      tools: await listMcpTools(state)
+    });
+    return;
+  }
+
+  if (parsed.command === "mcp" && parsed.subcommand === "add") {
+    const [name, command, ...cmdArgs] = parsed.rest;
+    if (!name || !command) throw new Error("Usage: mcp add <name> <command> [args...]");
+    const next = [...(state.mcpServers || []).filter((item) => item.name !== name), { name, command, args: cmdArgs }];
+    state = { ...state, mcpServers: next };
+    await saveState(state);
+    print(`mcp server saved: ${name}`);
+    return;
+  }
+
+  if (parsed.command === "mcp" && parsed.subcommand === "remove") {
+    const name = parsed.rest[0];
+    if (!name) throw new Error("Usage: mcp remove <name>");
+    state = { ...state, mcpServers: (state.mcpServers || []).filter((item) => item.name !== name) };
+    await saveState(state);
+    print(`mcp server removed: ${name}`);
+    return;
+  }
+
+  if (parsed.command === "auth" && parsed.subcommand === "google") {
+    const google = new GoogleIntegration();
+    const result = await google.connect(getGoogleUserId(), ["gmail", "calendar", "drive", "docs", "sheets", "tasks", "contacts", "meet"]);
+    print(result.success ? `google connected: ${result.email}` : `google auth failed: ${result.error}`);
+    return;
+  }
+
+  if (parsed.command === "logout" && parsed.subcommand === "google") {
+    const google = new GoogleIntegration();
+    try {
+      await google.disconnect(getGoogleUserId());
+      print("google disconnected");
+    } catch (error) {
+      print(`google logout failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     return;
   }
 
@@ -285,6 +341,25 @@ async function main() {
   }
 
   print(HELP);
+}
+
+async function readVersion(): Promise<string> {
+  try {
+    const raw = await readFile(join(__dirname, "../package.json"), "utf8");
+    const pkg = JSON.parse(raw);
+    return String(pkg?.version || "unknown");
+  } catch {
+    return "unknown";
+  }
+}
+
+function getGoogleUserId(): string {
+  return (
+    process.env.FORGE_GOOGLE_USER_ID ||
+    process.env.USER ||
+    process.env.USERNAME ||
+    "default"
+  );
 }
 
 main().catch((err) => {

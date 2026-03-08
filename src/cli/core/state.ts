@@ -3,6 +3,8 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { ForgeState } from "../types";
 
+type ParsedMcpServer = NonNullable<ForgeState["mcpServers"]>[number];
+
 const defaultState: ForgeState = {
   projectRoot: process.cwd(),
   autoApprove: false,
@@ -14,7 +16,8 @@ const defaultState: ForgeState = {
     provider: "openai",
     model: "gpt-4.1-mini"
   },
-  apiKeys: {}
+  apiKeys: {},
+  mcpServers: []
 };
 
 export const statePath = join(homedir(), ".config", "cognautic-forge", "state.json");
@@ -40,7 +43,20 @@ export async function loadState(): Promise<ForgeState> {
       apiKeys: {
         ...defaultState.apiKeys,
         ...(parsed.apiKeys || {})
-      }
+      },
+      mcpServers: Array.isArray(parsed.mcpServers)
+        ? parsed.mcpServers
+            .filter((item): item is ParsedMcpServer => Boolean(item && typeof item === "object"))
+            .map((item) => ({
+              name: String(item?.name || "").trim(),
+              command: String(item?.command || "").trim(),
+              args: Array.isArray(item?.args) ? item.args.map((arg: unknown) => String(arg)) : [],
+              env: item?.env && typeof item.env === "object"
+                ? Object.fromEntries(Object.entries(item.env).map(([k, v]) => [k, String(v)]))
+                : {}
+            }))
+            .filter((item) => item.name && item.command)
+        : []
     };
   } catch {
     return defaultState;

@@ -1,4 +1,7 @@
 import { chromium, type BrowserContext, type Page } from "playwright";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 let context: BrowserContext | null = null;
 let page: Page | null = null;
@@ -8,16 +11,27 @@ let aiCursorY = 120;
 let aiCursorVisible = false;
 let launchUserDataDir = ".forge-data/browser";
 let launchExecutablePath: string | undefined;
+let lastPageSnapshot:
+  | {
+      url: string;
+      title: string;
+      modalCount: number;
+      pageCount: number;
+      bodyHash: number;
+    }
+  | null = null;
+let pendingDialogMessages: string[] = [];
 
 export async function launchBrowser(
   userDataDir = ".forge-data/browser",
   executablePath?: string
 ): Promise<void> {
-  launchUserDataDir = userDataDir;
+  launchUserDataDir = resolveLaunchUserDataDir(userDataDir, executablePath);
   launchExecutablePath = executablePath || undefined;
 
   if (!context) {
-    context = await launchContextOrThrow(userDataDir, executablePath || undefined);
+    context = await launchContextOrThrow(launchUserDataDir, executablePath || undefined);
+    attachContextObservers(context);
     page = context.pages()[0] ?? (await context.newPage());
     return;
   }
@@ -27,7 +41,8 @@ export async function launchBrowser(
       page = context.pages()[0] ?? (await context.newPage());
     }
   } catch {
-    context = await launchContextOrThrow(userDataDir, executablePath || undefined);
+    context = await launchContextOrThrow(launchUserDataDir, executablePath || undefined);
+    attachContextObservers(context);
     page = context.pages()[0] ?? (await context.newPage());
   }
 }
@@ -40,14 +55,28 @@ export async function resetBrowser(): Promise<void> {
   }
   context = null;
   page = null;
+  lastPageSnapshot = null;
+  pendingDialogMessages = [];
 }
 
 async function launchContextOrThrow(userDataDir: string, executablePath?: string): Promise<BrowserContext> {
   try {
-    return await chromium.launchPersistentContext(userDataDir, {
+    const launched = await chromium.launchPersistentContext(userDataDir, {
       headless: false,
-      executablePath
+      executablePath,
+      ignoreDefaultArgs: ["--enable-automation"],
+      args: [
+        "--disable-blink-features=AutomationControlled",
+        "--no-default-browser-check",
+        "--disable-dev-shm-usage"
+      ]
     });
+    await launched.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", {
+        get: () => undefined
+      });
+    });
+    return launched;
   } catch (err) {
     const msg = String((err as Error)?.message || err || "");
     if (/Executable doesn't exist at/i.test(msg) || /playwright install/i.test(msg)) {
@@ -62,6 +91,44 @@ async function launchContextOrThrow(userDataDir: string, executablePath?: string
     }
     throw err;
   }
+}
+
+function resolveLaunchUserDataDir(defaultUserDataDir: string, executablePath?: string): string {
+  if (!executablePath) return defaultUserDataDir;
+  const detected = detectInstalledBrowserUserDataDir(executablePath);
+  return detected || defaultUserDataDir;
+}
+
+function detectInstalledBrowserUserDataDir(executablePath: string): string | null {
+  const normalized = executablePath.toLowerCase();
+  const home = homedir();
+  const candidates: string[] = [];
+
+  if (process.platform === "linux") {
+    if (normalized.includes("brave")) candidates.push(join(home, ".config", "BraveSoftware", "Brave-Browser"));
+    if (normalized.includes("chrome")) candidates.push(join(home, ".config", "google-chrome"));
+    if (normalized.includes("chromium")) candidates.push(join(home, ".config", "chromium"));
+    if (normalized.includes("microsoft-edge") || normalized.includes("msedge")) {
+      candidates.push(join(home, ".config", "microsoft-edge"));
+    }
+  } else if (process.platform === "darwin") {
+    if (normalized.includes("brave")) candidates.push(join(home, "Library", "Application Support", "BraveSoftware", "Brave-Browser"));
+    if (normalized.includes("chrome")) candidates.push(join(home, "Library", "Application Support", "Google", "Chrome"));
+    if (normalized.includes("chromium")) candidates.push(join(home, "Library", "Application Support", "Chromium"));
+    if (normalized.includes("microsoft-edge") || normalized.includes("msedge")) {
+      candidates.push(join(home, "Library", "Application Support", "Microsoft Edge"));
+    }
+  } else if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || join(home, "AppData", "Local");
+    if (normalized.includes("brave")) candidates.push(join(localAppData, "BraveSoftware", "Brave-Browser", "User Data"));
+    if (normalized.includes("chrome")) candidates.push(join(localAppData, "Google", "Chrome", "User Data"));
+    if (normalized.includes("chromium")) candidates.push(join(localAppData, "Chromium", "User Data"));
+    if (normalized.includes("microsoft-edge") || normalized.includes("msedge")) {
+      candidates.push(join(localAppData, "Microsoft", "Edge", "User Data"));
+    }
+  }
+
+  return candidates.find((candidate) => existsSync(candidate)) || null;
 }
 
 export async function navigate(url: string): Promise<void> {
@@ -116,6 +183,38 @@ export async function typeAtCursor(text: string): Promise<void> {
 export async function extract(selector: string): Promise<string> {
   const p = await getPage();
   return (await p.textContent(selector)) ?? "";
+}
+
+export async function findTextPatterns(pattern: string, limit = 10): Promise<string> {
+  const p = await getPage();
+  if (overlayEnabled) await pulseOverlay("find-text");
+  const matches = await p.evaluate(
+    ({ pattern, limit }) => {
+      const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
+      const needle = pattern.trim().toLowerCase();
+      if (!needle) return [];
+      const doc = (globalThis as any).document;
+      const elements = Array.from(doc?.querySelectorAll?.("body *") || []);
+      const out: Array<{ text: string; tag: string; id: string; classes: string }> = [];
+      for (const el of elements) {
+        if (out.length >= limit) break;
+        const node = el as any;
+        const raw = normalize(node.innerText || node.textContent || "");
+        if (!raw) continue;
+        if (raw.length > 400) continue;
+        if (!raw.toLowerCase().includes(needle)) continue;
+        out.push({
+          text: raw.slice(0, 240),
+          tag: node.tagName.toLowerCase(),
+          id: node.id || "",
+          classes: typeof node.className === "string" ? node.className.trim().slice(0, 120) : ""
+        });
+      }
+      return out;
+    },
+    { pattern, limit }
+  );
+  return JSON.stringify(matches).slice(0, 4000);
 }
 
 export async function evaluate(script: string): Promise<unknown> {
@@ -188,6 +287,62 @@ export async function readDomText(limit = 6000): Promise<string> {
   return String(text).slice(0, limit);
 }
 
+export async function observeBrowserState(): Promise<string> {
+  const p = await getPage();
+  const snapshot = await p.evaluate(() => {
+    const doc = (globalThis as any).document;
+    const text = String(doc?.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 4000);
+    const hash = Array.from(text).reduce((acc, ch) => ((acc * 31) + ch.charCodeAt(0)) >>> 0, 7);
+    const modalSelectors = [
+      '[role="dialog"]',
+      '[aria-modal="true"]',
+      ".modal",
+      ".popup",
+      ".dialog",
+      "[data-testid*='modal']",
+      "[data-testid*='dialog']"
+    ];
+    const modalCount = modalSelectors.reduce((count, selector) => {
+      try {
+        return count + (doc?.querySelectorAll?.(selector)?.length || 0);
+      } catch {
+        return count;
+      }
+    }, 0);
+    return {
+      url: String((globalThis as any).location?.href || ""),
+      title: String(doc?.title || ""),
+      modalCount,
+      bodyHash: hash
+    };
+  });
+
+  const next = {
+    ...snapshot,
+    pageCount: context?.pages().length || 1
+  };
+  const notices: string[] = [];
+
+  if (!lastPageSnapshot) {
+    notices.push(`browser_state initialized at ${next.url || "(unknown url)"}`);
+  } else {
+    if (next.url !== lastPageSnapshot.url) notices.push(`url changed: ${next.url}`);
+    if (next.title !== lastPageSnapshot.title) notices.push(`title changed: ${next.title || "(untitled)"}`);
+    if (next.modalCount > lastPageSnapshot.modalCount) notices.push(`popup/modal appeared (${next.modalCount} visible)`);
+    if (next.modalCount < lastPageSnapshot.modalCount) notices.push(`popup/modal count decreased (${next.modalCount} visible)`);
+    if (next.pageCount > lastPageSnapshot.pageCount) notices.push(`new popup/page opened (${next.pageCount} total pages)`);
+    if (next.pageCount < lastPageSnapshot.pageCount) notices.push(`popup/page closed (${next.pageCount} total pages)`);
+    if (next.bodyHash !== lastPageSnapshot.bodyHash) notices.push("dom changed");
+  }
+
+  if (pendingDialogMessages.length) {
+    notices.push(...pendingDialogMessages.splice(0).map((msg) => `dialog appeared: ${msg}`));
+  }
+
+  lastPageSnapshot = next;
+  return notices.join("; ");
+}
+
 export async function setVisualOverlay(enabled: boolean): Promise<void> {
   overlayEnabled = enabled;
   const p = await getPage();
@@ -255,6 +410,19 @@ async function pulseOverlay(label: string): Promise<void> {
       el.style.boxShadow = "0 0 18px rgba(58,169,255,0.85)";
     }, 180);
   }, label);
+}
+
+function attachContextObservers(ctx: BrowserContext): void {
+  ctx.on("page", (newPage) => {
+    newPage.on("dialog", (dialog) => {
+      pendingDialogMessages.push(dialog.message().slice(0, 200));
+    });
+  });
+  for (const existingPage of ctx.pages()) {
+    existingPage.on("dialog", (dialog) => {
+      pendingDialogMessages.push(dialog.message().slice(0, 200));
+    });
+  }
 }
 
 async function highlightSelector(selector: string): Promise<void> {

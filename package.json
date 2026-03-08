@@ -1,6 +1,6 @@
 {
   "name": "@cognautic.space/forge",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "private": false,
   "type": "commonjs",
   "description": "Cognautic Forge - local-first AI co-worker CLI",
@@ -18,6 +18,8 @@
     "build": "npm run build:npm",
     "clean": "node -e \"require('fs').rmSync('dist',{ recursive:true, force:true })\"",
     "build:npm": "npm run clean && tsc -p tsconfig.build.json",
+    "convex:dev": "convex dev",
+    "convex:deploy": "convex deploy",
     "prepare": "npm run build:npm",
     "dev": "bun run src/main.ts",
     "check": "bunx tsc --noEmit",
@@ -25,7 +27,9 @@
   },
   "dependencies": {
     "chromium-bidi": "^15.0.0",
+    "convex": "^1.32.0",
     "enquirer": "^2.4.1",
+    "googleapis": "^144.0.0",
     "playwright": "^1.55.0",
     "zod": "^3.24.1"
   },

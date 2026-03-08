@@ -7,6 +7,8 @@ import { saveState } from "../core/state";
 import { PROVIDERS, fetchModels, setApiKeyInConfig, setProvider } from "../providers/manager";
 import { runAiTurn } from "../agent/chatAgent";
 import { runCommand } from "../terminal/exec";
+import { listMcpTools } from "../mcp/client";
+import { GoogleIntegration } from "../../integrations/google";
 import {
   addArtifact,
   addTask,
@@ -68,6 +70,9 @@ const COMMANDS = [
   "/timeline",
   "/roles",
   "/memory",
+  "/mcp",
+  "/auth",
+  "/logout",
   "/rename",
   "/clear"
 ];
@@ -272,8 +277,10 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       chatDirty = true;
 
       activeTurnAbort = new AbortController();
-      const spinner = createSpinner("ai");
+      const spinner = createSpinner("thinking...");
       activeSpinner = spinner;
+      process.stdout.write("\r\x1b[2K");
+      process.stdout.write(`${C.yellow}ai>${C.reset}\n`);
       spinner.start();
       let printedToolBlock = false;
       try {
@@ -310,6 +317,20 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
             spinner.pause();
             renderPlan(currentPlan);
             spinner.resume();
+          },
+          onUserWait: async ({ reason, prompt, timeoutSeconds }) => {
+            spinner.pause();
+            const label = prompt?.trim() || "Press Enter when done, or type cancel.";
+            const timeoutHint = timeoutSeconds ? ` Suggested timeout: ${timeoutSeconds}s.` : "";
+            process.stdout.write(
+              `${C.yellow}wait>${C.reset} ${C.white}${reason}${C.reset}${C.gray}${timeoutHint}${C.reset}\n`
+            );
+            const answer = (await question(rl, `${C.yellow}wait>${C.reset} ${label} `)).trim();
+            spinner.resume();
+            if (/^(cancel|stop|abort)$/i.test(answer)) {
+              return `user did not complete manual step: ${reason}`;
+            }
+            return `user confirmed manual step completed: ${reason}`;
           }
         });
         spinner.stop();
@@ -398,6 +419,22 @@ function createSpinner(initialLabel: string): {
       paused = false;
       draw();
     }
+  };
+}
+
+function createNoopSpinner(): {
+  start: () => void;
+  stop: () => void;
+  setLabel: (label: string) => void;
+  pause: () => void;
+  resume: () => void;
+} {
+  return {
+    start() {},
+    stop() {},
+    setLabel(_label: string) {},
+    pause() {},
+    resume() {}
   };
 }
 
@@ -796,6 +833,90 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
     return false;
   }
 
+  if (cmd === "/mcp") {
+    const sub = (args[0] || "list").trim().toLowerCase();
+    if (sub === "list") {
+      const servers = ctx.state.mcpServers || [];
+      if (!servers.length) {
+        console.log("(no mcp servers)");
+        return false;
+      }
+      for (const server of servers) {
+        console.log(`${server.name}: ${server.command} ${(server.args || []).join(" ")}`.trim());
+      }
+      return false;
+    }
+    if (sub === "tools") {
+      const tools = await listMcpTools(ctx.state);
+      if (!tools.length) {
+        console.log("(no mcp tools discovered)");
+        return false;
+      }
+      for (const tool of tools) console.log(`mcp.${tool.server}.${tool.name}${tool.description ? ` - ${tool.description}` : ""}`);
+      return false;
+    }
+    if (sub === "add") {
+      const [name, command, ...cmdArgs] = args.slice(1);
+      if (!name || !command) {
+        console.log("usage: /mcp add <name> <command> [args...]");
+        return false;
+      }
+      ctx.state = {
+        ...ctx.state,
+        mcpServers: [...(ctx.state.mcpServers || []).filter((item) => item.name !== name), { name, command, args: cmdArgs }]
+      };
+      await saveState(ctx.state);
+      console.log(`mcp server saved: ${name}`);
+      return false;
+    }
+    if (sub === "remove") {
+      const name = args[1];
+      if (!name) {
+        console.log("usage: /mcp remove <name>");
+        return false;
+      }
+      ctx.state = { ...ctx.state, mcpServers: (ctx.state.mcpServers || []).filter((item) => item.name !== name) };
+      await saveState(ctx.state);
+      console.log(`mcp server removed: ${name}`);
+      return false;
+    }
+    console.log("usage: /mcp <list|tools|add|remove> ...");
+    return false;
+  }
+
+  if (cmd === "/auth") {
+    const provider = (args[0] || "").trim().toLowerCase();
+    if (provider !== "google") {
+      console.log("usage: /auth google");
+      return false;
+    }
+    console.log("opening Google login in your browser...");
+    const google = new GoogleIntegration();
+    const result = await google.connect(getGoogleUserId(), ["gmail", "calendar", "drive", "docs", "sheets", "tasks", "contacts", "meet"]);
+    if (!result.success) {
+      console.log(`google auth failed: ${result.error}`);
+      return false;
+    }
+    console.log(`google connected: ${result.email}`);
+    return false;
+  }
+
+  if (cmd === "/logout") {
+    const provider = (args[0] || "").trim().toLowerCase();
+    if (provider !== "google") {
+      console.log("usage: /logout google");
+      return false;
+    }
+    const google = new GoogleIntegration();
+    try {
+      await google.disconnect(getGoogleUserId());
+      console.log("google disconnected");
+    } catch (error) {
+      console.log(`google logout failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return false;
+  }
+
   console.log(`unknown command: ${cmd}. use /help`);
   return false;
 }
@@ -844,6 +965,15 @@ function completeLine(line: string, ctx: ChatContext): [string[], string] {
   if (trimmed === "/memory" || trimmed === "/memory ") {
     return [["show", "clear"], ""];
   }
+  if (trimmed === "/mcp" || trimmed === "/mcp ") {
+    return [["list", "tools", "add", "remove"], ""];
+  }
+  if (trimmed === "/auth" || trimmed === "/auth ") {
+    return [["google"], ""];
+  }
+  if (trimmed === "/logout" || trimmed === "/logout ") {
+    return [["google"], ""];
+  }
   if (trimmed === "/rename" || trimmed === "/rename ") return [["my-chat"], ""];
 
   const tokens = trimmed.split(/\s+/);
@@ -882,6 +1012,15 @@ function completeLine(line: string, ctx: ChatContext): [string[], string] {
   }
   if (tokens[0] === "/memory" && tokens.length === 2) {
     return [["show", "clear"].filter((v) => v.startsWith(current)), current];
+  }
+  if (tokens[0] === "/mcp" && tokens.length === 2) {
+    return [["list", "tools", "add", "remove"].filter((v) => v.startsWith(current)), current];
+  }
+  if (tokens[0] === "/auth" && tokens.length === 2) {
+    return [["google"].filter((v) => v.startsWith(current)), current];
+  }
+  if (tokens[0] === "/logout" && tokens.length === 2) {
+    return [["google"].filter((v) => v.startsWith(current)), current];
   }
   if (tokens[0] === "/searchmode" && tokens.length === 2) {
     return [["safe", "manual"].filter((v) => v.startsWith(current)), current];
@@ -1267,11 +1406,22 @@ function printHelp(): void {
     "/timeline",
     "/roles [show] | /roles set <role> <owner>",
     "/memory [show|clear]",
+    "/auth google",
+    "/logout google",
     "/rename <chat-name>",
     "Shift+Tab toggles input mode: chat <-> shell",
     "Ctrl+V pastes clipboard image as attachment placeholder",
     "<any non-/ text> sends a chat prompt"
   ].join("\n"));
+}
+
+function getGoogleUserId(): string {
+  return (
+    process.env.FORGE_GOOGLE_USER_ID ||
+    process.env.USER ||
+    process.env.USERNAME ||
+    "default"
+  );
 }
 
 async function runConfigWizard(rl: readline.Interface, ctx: ChatContext): Promise<void> {

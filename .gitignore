@@ -17,14 +17,15 @@ release/
 # Local runtime/state
 .forge-data/
 forge-data/
+.convex/
 *.log
 logs/
-
+convex/
 # Secrets and local env
 .env
 .env.*
 !.env.example
-
+.forge/
 # OS/editor files
 .DS_Store
 Thumbs.db
