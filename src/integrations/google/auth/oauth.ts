@@ -5,6 +5,11 @@ import { getRedirectUri, startCallbackServer } from "./callback-server";
 import { deleteTokens, loadTokens, saveTokens } from "./tokens";
 import { SCOPES } from "./scopes";
 
+const DEFAULT_CONVEX_GOOGLE_AUTH_URL = "https://limitless-eel-242.convex.site/google/auth";
+const DEFAULT_CONVEX_GOOGLE_EXCHANGE_URL = "https://limitless-eel-242.convex.site/google/exchange";
+const DEFAULT_CONVEX_GOOGLE_LOGOUT_URL = "https://limitless-eel-242.convex.site/google/logout";
+const DEFAULT_CONVEX_GOOGLE_REFRESH_URL = "https://limitless-eel-242.convex.site/google/refresh";
+
 function requiredEnv(name: "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET"): string {
   const value = process.env[name];
   if (!value) throw new Error(`${name} is required`);
@@ -120,7 +125,7 @@ export async function connectGoogle(
  */
 export async function disconnectGoogle(userId: string): Promise<{ success: true } | { success: false; error: string }> {
   try {
-    const logoutUrl = process.env.CONVEX_GOOGLE_LOGOUT_URL || "";
+    const logoutUrl = process.env.CONVEX_GOOGLE_LOGOUT_URL || DEFAULT_CONVEX_GOOGLE_LOGOUT_URL;
     if (logoutUrl) {
       const res = await fetch(logoutUrl, {
         method: "POST",
@@ -160,7 +165,7 @@ function getOpenCommand(url: string): { command: string; args: string[] } {
 }
 
 function getServerAuthUrl(userId: string, scopes: string[], redirectUri: string): string | null {
-  const base = process.env.CONVEX_GOOGLE_AUTH_URL || "";
+  const base = process.env.CONVEX_GOOGLE_AUTH_URL || DEFAULT_CONVEX_GOOGLE_AUTH_URL;
   if (!base) return null;
   const url = new URL(base);
   url.searchParams.set("userId", userId);
@@ -170,11 +175,11 @@ function getServerAuthUrl(userId: string, scopes: string[], redirectUri: string)
 }
 
 function getServerExchangeUrl(): string | null {
-  return process.env.CONVEX_GOOGLE_EXCHANGE_URL || null;
+  return process.env.CONVEX_GOOGLE_EXCHANGE_URL || DEFAULT_CONVEX_GOOGLE_EXCHANGE_URL;
 }
 
 function getServerRefreshUrl(): string | null {
-  return process.env.CONVEX_GOOGLE_REFRESH_URL || null;
+  return process.env.CONVEX_GOOGLE_REFRESH_URL || DEFAULT_CONVEX_GOOGLE_REFRESH_URL;
 }
 
 async function exchangeCodeLocally(
