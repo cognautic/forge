@@ -1,6 +1,6 @@
 {
   "name": "@cognautic.space/forge",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "private": false,
   "type": "commonjs",
   "description": "Cognautic Forge - local-first AI co-worker CLI",
@@ -11,6 +11,7 @@
   },
   "files": [
     "dist/**/*.js",
+    "src/assets/**/*.svg",
     "README.md",
     "LICENSE*"
   ],

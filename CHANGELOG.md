@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.12 - 2026-03-09
+- Improved interactive chat UI:
+  - MCP server warmup starts on load with compact status output
+  - sent user prompts now render as boxed transcript cards
+  - resumed chat history renders prior user turns in the same boxed style
+  - active input reverted to a plain inline prompt while keeping boxed sent messages
+  - removed the standalone `ai>` preface so only the spinner shows while the assistant is thinking, with `ai>` shown only for the actual response
+  - startup header now opens with a simplified session info box and divider, without the earlier ASCII/SVG logo rendering
+  - improved prompt/response rendering cleanup around submit, abort, and modal confirmation flows
+  - tool execution output now renders with per-tool dividers, including a separator between tool traces and final assistant text responses
+
 ## 0.0.11 - 2026-03-08
 - Fixed Google auth reuse so Forge no longer opens the Google login flow on every restart when saved tokens and scopes are still valid
 - Fixed modal prompt rendering so tool confirmations and `user.wait` no longer leak stray `you>` prompt lines like `you> y`

@@ -7,7 +7,7 @@ import { saveState } from "../core/state";
 import { PROVIDERS, fetchModels, setApiKeyInConfig, setProvider } from "../providers/manager";
 import { runAiTurn } from "../agent/chatAgent";
 import { runCommand } from "../terminal/exec";
-import { listMcpTools } from "../mcp/client";
+import { getEffectiveMcpServers, getMcpDiagnostics, listMcpTools, prewarmMcpServers } from "../mcp/client";
 import { GoogleIntegration } from "../../integrations/google";
 import {
   addArtifact,
@@ -94,6 +94,10 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     historySize: 300,
     completer: (line: string) => completeLine(line, ctx)
   });
+  const stdinWasRaw = process.stdin.isTTY ? Boolean((process.stdin as NodeJS.ReadStream).isRaw) : false;
+  if (process.stdin.isTTY && !stdinWasRaw) {
+    (process.stdin as NodeJS.ReadStream).setRawMode(true);
+  }
   const pasteState: { mode: PasteMode } = { mode: "idle" };
   let suppressQueuedPasteLines = 0;
   let pendingTextPasteToken: string | null = null;
@@ -189,19 +193,37 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   const updateInfo = await checkForNpmUpdate();
   renderHeader(ctx.state);
   if (updateInfo) renderUpdateBanner(updateInfo.current, updateInfo.latest, updateInfo.name);
-  if (resumed) {
-    console.log(`resumed chat: id=${ctx.chat.id} name=${ctx.chat.name}`);
-    if (ctx.chat.turns.length) {
-      console.log(`history (${ctx.chat.turns.length} turns):`);
-      for (const turn of ctx.chat.turns.slice(-80)) {
-        const prefix = turn.role === "assistant" ? "ai>" : "you>";
-        console.log(`${prefix} ${turn.content}`);
+  const effectiveMcpServers = getEffectiveMcpServers(ctx.state);
+  if (effectiveMcpServers.length) {
+    console.log(`${C.gray}mcp> loading ${effectiveMcpServers.length} servers in background...${C.reset}`);
+    void prewarmMcpServers(ctx.state, ({ completed, total, server, tools, ok, message }) => {
+      const status = ok ? `${tools} tools` : `failed`;
+      process.stdout.write(`\r\x1b[2K${C.gray}mcp> ${completed}/${total} ${server} ${status}${C.reset}\n`);
+      redrawPrompt(rl, promptPrefix());
+    }).then((tools) => {
+      const serverCount = effectiveMcpServers.length;
+      process.stdout.write(`\r\x1b[2K${C.gray}mcp ready: ${serverCount} servers, ${tools.length} tools${C.reset}\n`);
+      for (const diagnostic of getMcpDiagnostics(ctx.state)) {
+        if (!diagnostic.ok || diagnostic.tools === 0) {
+          process.stdout.write(`\r\x1b[2K${C.gray}mcp! ${diagnostic.server}: ${diagnostic.message}${C.reset}\n`);
+        }
       }
-    } else {
-      console.log("history: (empty)");
+      redrawPrompt(rl, promptPrefix());
+    }).catch(() => {
+      process.stdout.write(`\r\x1b[2K${C.gray}mcp warmup skipped${C.reset}\n`);
+      redrawPrompt(rl, promptPrefix());
+    });
+  }
+  if (resumed) {
+    if (ctx.chat.turns.length) {
+      for (const turn of ctx.chat.turns.slice(-80)) {
+        if (turn.role === "user") {
+          renderMessageBox("you", turn.content, "user");
+        } else {
+          console.log(`ai> ${turn.content}`);
+        }
+      }
     }
-  } else {
-    console.log(`new chat: id=${ctx.chat.id} name=${ctx.chat.name}`);
   }
 
   if (!ctx.state.onboardingComplete) {
@@ -225,6 +247,8 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     }
 
     const source = await question(rl, promptPrefix());
+    (rl as any).line = "";
+    (rl as any).cursor = 0;
     pendingAttachments = pendingAttachments.filter((att) => source.includes(att.token));
     const input = source
       .replace(/\[pasted [^\]]+\]/gi, " ")
@@ -276,20 +300,24 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     pendingAttachments = [];
 
     try {
+      rl.pause();
+      if (process.stdout.isTTY) {
+        process.stdout.write("\x1b[1A\r\x1b[2K");
+      }
       // Save user message immediately so it survives long-running/aborted turns.
       await appendTurn(ctx.chat.id, "user", finalInput);
       ctx.chat.turns.push({ ts: new Date().toISOString(), role: "user", content: finalInput });
       ctx.sessionMemory.push({ ts: new Date().toISOString(), role: "user", content: finalInput });
       ctx.chat.updatedAt = new Date().toISOString();
       chatDirty = true;
+      renderMessageBox("you", finalInput, "user");
 
       activeTurnAbort = new AbortController();
       const spinner = createSpinner("thinking...");
       activeSpinner = spinner;
       process.stdout.write("\r\x1b[2K");
-      process.stdout.write(`${C.yellow}ai>${C.reset}\n`);
       spinner.start();
-      let printedToolBlock = false;
+      const toolDivider = `${C.dim}${"-".repeat(72)}${C.reset}\n`;
       try {
         const response = await runAiTurn(ctx.state, finalInput, {
           signal: activeTurnAbort.signal,
@@ -314,16 +342,14 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
           onStatus: (status) => spinner.setLabel(`ai ${status}`),
           onToolCall: (tool, args) => {
             spinner.pause();
-            if (!printedToolBlock) {
-              process.stdout.write(`\n${C.dim}${"-".repeat(72)}${C.reset}\n`);
-              printedToolBlock = true;
-            }
+            process.stdout.write(`\n${toolDivider}`);
             process.stdout.write(`${C.cyan}• Ran${C.reset} ${formatToolCall(tool, args)}\n${C.gray}  └${C.reset}\n`);
             spinner.resume();
           },
           onToolResult: (tool, resultPreview) => {
             spinner.pause();
             process.stdout.write(`${C.gray}    > ${compactLine(resultPreview)}${C.reset}\n`);
+            process.stdout.write(toolDivider);
             spinner.resume();
           },
           onPlanUpdate: (plan) => {
@@ -356,7 +382,6 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
         });
         spinner.stop();
         process.stdout.write("\r\x1b[2K");
-        if (printedToolBlock) process.stdout.write(`${C.dim}${"-".repeat(72)}${C.reset}\n`);
         process.stdout.write(`${C.green}ai>${C.reset} ${C.white}${response}${C.reset}\n`);
         await appendTurn(ctx.chat.id, "assistant", response);
         ctx.chat.turns.push({ ts: new Date().toISOString(), role: "assistant", content: response });
@@ -371,6 +396,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       console.error(`error> ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       activeTurnAbort = null;
+      rl.resume();
     }
     return false;
   }
@@ -391,6 +417,9 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   if (chatDirty) await Promise.race([flushChat(), sleepMs(1200)]);
   if (process.stdout.isTTY) {
     process.stdout.write("\r\x1b[2K");
+  }
+  if (process.stdin.isTTY && !stdinWasRaw) {
+    (process.stdin as NodeJS.ReadStream).setRawMode(false);
   }
   console.log(`to resume this chat use: forge resume ${ctx.chat.name}`);
 }
@@ -475,6 +504,38 @@ function compactLine(input: string): string {
   const oneLine = String(input || "").replace(/\s+/g, " ").trim();
   if (!oneLine) return "(ok)";
   return oneLine.length > 220 ? `${oneLine.slice(0, 220)}...` : oneLine;
+}
+
+function renderMessageBox(label: string, content: string, tone: "user" | "plain" = "plain"): void {
+  const cols = Math.max(Math.min(process.stdout.columns || 96, 120), 60);
+  const inner = cols - 4;
+  const title = `${label}`.trim();
+  const lines = wrapForBox(String(content || "").trim() || "(empty)", inner);
+  const borderColor = tone === "user" ? C.gray : C.blue;
+  console.log(`${borderColor}╭${"─".repeat(cols - 2)}╮${C.reset}`);
+  console.log(`${borderColor}│${C.reset} ${title.padEnd(inner)} ${borderColor}│${C.reset}`);
+  for (const line of lines) {
+    console.log(`${borderColor}│${C.reset} ${line.padEnd(inner)} ${borderColor}│${C.reset}`);
+  }
+  console.log(`${borderColor}╰${"─".repeat(cols - 2)}╯${C.reset}`);
+}
+
+function wrapForBox(text: string, width: number): string[] {
+  const out: string[] = [];
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.replace(/\t/g, "    ");
+    if (!line) {
+      out.push("");
+      continue;
+    }
+    let rest = line;
+    while (rest.length > width) {
+      out.push(rest.slice(0, width));
+      rest = rest.slice(width);
+    }
+    out.push(rest);
+  }
+  return out;
 }
 
 function renderPlan(plan: { explanation?: string; steps: UiPlanStep[] }): void {
@@ -877,6 +938,9 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
       const tools = await listMcpTools(ctx.state);
       if (!tools.length) {
         console.log("(no mcp tools discovered)");
+        for (const diagnostic of getMcpDiagnostics(ctx.state)) {
+          console.log(`mcp ${diagnostic.server}: ${diagnostic.message}`);
+        }
         return false;
       }
       for (const tool of tools) console.log(`mcp.${tool.server}.${tool.name}${tool.description ? ` - ${tool.description}` : ""}`);
@@ -957,7 +1021,6 @@ async function autoRefreshModels(ctx: ChatContext): Promise<void> {
       await saveState(ctx.state);
       console.log(`model auto-selected: ${models[0]}`);
     }
-    console.log(`models cached: ${models.length}`);
   } catch (err) {
     ctx.modelSuggestions = [];
     console.log(`models refresh skipped: ${err instanceof Error ? err.message : String(err)}`);
@@ -1107,24 +1170,38 @@ function enableEscAbort(onAbort: () => void, isAbortArmed: () => boolean): () =>
 
   readline.emitKeypressEvents(input);
   let lastEscAt = 0;
-  const onKeypress = (_str: string, key: { name?: string }) => {
-    if (key?.name !== "escape") return;
+  const tryAbort = () => {
     if (isAbortArmed()) {
       lastEscAt = 0;
       onAbort();
-      return;
+      return true;
     }
     const now = Date.now();
     if (now - lastEscAt < 650) {
       lastEscAt = 0;
       onAbort();
-      return;
+      return true;
     }
     lastEscAt = now;
+    return false;
+  };
+  const onKeypress = (_str: string, key: { name?: string }) => {
+    if (key?.name !== "escape") return;
+    tryAbort();
+  };
+  const onData = (chunk: Buffer | string) => {
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    if (text === "\u001b") {
+      tryAbort();
+    }
   };
 
   input.on("keypress", onKeypress);
-  return () => input.off("keypress", onKeypress);
+  input.on("data", onData);
+  return () => {
+    input.off("keypress", onKeypress);
+    input.off("data", onData);
+  };
 }
 
 function enableCtrlYToggle(onToggle: () => void | Promise<void>): () => void {
@@ -1309,35 +1386,15 @@ function ghostSuffix(line: string, trimmed: string, ctx: ChatContext): string {
 
 function renderHeader(state: ForgeState): void {
   const width = 96;
-  const inner = width - 4;
   const lines = [
-    "Cognautic Forge Interactive Chat",
     `provider=${state.provider.provider} model=${state.provider.model} mode=${state.executionMode || "safe"} searchmode=${state.searchMode || "safe"}`,
     `root=${state.projectRoot}`,
     "Type /help for commands. Press Right/End for ghost autocomplete.",
     `Discord: ${C.blue}${C.underline}https://discord.gg/QrfpWDuZqd${C.reset}`,
     `Instagram: ${C.blue}${C.underline}https://www.instagram.com/cognautic/${C.reset}`
   ];
-
-  const borderTop = `╭${"─".repeat(width - 2)}╮`;
-  const borderMid = `├${"─".repeat(width - 2)}┤`;
-  const borderBottom = `╰${"─".repeat(width - 2)}╯`;
-
-  const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;]*m/g, "");
-  const boxLine = (s: string) => {
-    const plain = stripAnsi(s);
-    if (plain.length <= inner) {
-      return `${C.blue}│${C.reset} ${s}${" ".repeat(inner - plain.length)} ${C.blue}│${C.reset}`;
-    }
-    // For overflow lines, truncate by visible width to preserve border alignment.
-    return `${C.blue}│${C.reset} ${plain.slice(0, inner)} ${C.blue}│${C.reset}`;
-  };
-
-  console.log(`${C.blue}${borderTop}${C.reset}`);
-  console.log(boxLine(lines[0]));
-  console.log(`${C.blue}${borderMid}${C.reset}`);
-  for (const line of lines.slice(1)) console.log(boxLine(line));
-  console.log(`${C.blue}${borderBottom}${C.reset}`);
+  for (const line of lines) console.log(line);
+  console.log(`${C.gray}${"─".repeat(width)}${C.reset}`);
 }
 
 function printStatus(state: ForgeState, modelCount: number): void {

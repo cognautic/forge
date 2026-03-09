@@ -2,9 +2,15 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ForgeState, McpServerConfig } from "../types";
 
 type PendingRequest = { resolve: (value: any) => void; reject: (err: Error) => void };
-const MCP_INIT_TIMEOUT_MS = 20000;
-const MCP_LIST_TIMEOUT_MS = 10000;
-const MCP_CALL_TIMEOUT_MS = 30000;
+const MCP_INIT_TIMEOUT_MS = 60000;
+const MCP_LIST_TIMEOUT_MS = 30000;
+const MCP_CALL_TIMEOUT_MS = 60000;
+const MCP_DISCOVERY_RETRY_COOLDOWN_MS = 30000;
+const MCP_TOOL_CACHE_TTL_MS = 60000;
+const discoveryFailureUntil = new Map<string, number>();
+const toolCache = new Map<string, { expiresAt: number; tools: McpToolDescriptor[] }>();
+const pendingDiscovery = new Map<string, Promise<McpToolDescriptor[]>>();
+const serverDiagnostics = new Map<string, { ok: boolean; tools: number; message: string }>();
 
 export type McpToolDescriptor = {
   server: string;
@@ -107,6 +113,101 @@ class StdioMcpSession {
   }
 }
 
+export function getEffectiveMcpServers(state: ForgeState): McpServerConfig[] {
+  return [...(state.mcpServers || [])];
+}
+
+function serverCacheKey(server: McpServerConfig): string {
+  return JSON.stringify({
+    name: server.name,
+    command: server.command,
+    args: server.args || [],
+    env: server.env || {}
+  });
+}
+
+async function discoverServerTools(server: McpServerConfig): Promise<McpToolDescriptor[]> {
+  const cacheKey = serverCacheKey(server);
+  const cached = toolCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.tools;
+  }
+  const inFlight = pendingDiscovery.get(cacheKey);
+  if (inFlight) return await inFlight;
+
+  const run = (async () => {
+    const blockedUntil = discoveryFailureUntil.get(server.name) || 0;
+    if (blockedUntil > Date.now()) return [];
+    try {
+      const result = await withSession(server, async (session) =>
+        await withTimeout(
+          session.request("tools/list", {}),
+          MCP_LIST_TIMEOUT_MS,
+          () => `MCP tools/list timeout for ${server.name}.${session.errorContext()}`
+        )
+      );
+      const listed = Array.isArray(result?.tools) ? result.tools : [];
+      const tools = listed
+        .map((tool: unknown) => ({
+          server: server.name,
+          name: String((tool as { name?: unknown })?.name || "").trim(),
+          description: (tool as { description?: unknown })?.description
+            ? String((tool as { description?: unknown }).description)
+            : undefined,
+          inputSchema: (tool as { inputSchema?: unknown })?.inputSchema
+        }))
+        .filter((tool: McpToolDescriptor) => tool.name);
+      discoveryFailureUntil.delete(server.name);
+      toolCache.set(cacheKey, { expiresAt: Date.now() + MCP_TOOL_CACHE_TTL_MS, tools });
+      serverDiagnostics.set(server.name, {
+        ok: true,
+        tools: tools.length,
+        message: tools.length ? `${tools.length} tools` : "connected but exposed 0 tools"
+      });
+      return tools;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "tool discovery failed";
+      discoveryFailureUntil.set(server.name, Date.now() + MCP_DISCOVERY_RETRY_COOLDOWN_MS);
+      serverDiagnostics.set(server.name, { ok: false, tools: 0, message });
+      return [];
+    } finally {
+      pendingDiscovery.delete(cacheKey);
+    }
+  })();
+
+  pendingDiscovery.set(cacheKey, run);
+  return await run;
+}
+
+export async function prewarmMcpServers(
+  state: ForgeState,
+  onProgress?: (info: { total: number; completed: number; server: string; tools: number; ok: boolean; message: string }) => void
+): Promise<McpToolDescriptor[]> {
+  const servers = getEffectiveMcpServers(state);
+  const all: McpToolDescriptor[] = [];
+  let completed = 0;
+  await Promise.all(servers.map(async (server) => {
+    const tools = await discoverServerTools(server);
+    all.push(...tools);
+    completed += 1;
+    const diagnostic = serverDiagnostics.get(server.name) || { ok: tools.length > 0, tools: tools.length, message: tools.length ? `${tools.length} tools` : "0 tools" };
+    onProgress?.({ total: servers.length, completed, server: server.name, tools: tools.length, ok: diagnostic.ok, message: diagnostic.message });
+  }));
+  return all;
+}
+
+export function getMcpDiagnostics(state: ForgeState): Array<{ server: string; ok: boolean; tools: number; message: string }> {
+  return getEffectiveMcpServers(state).map((server) => {
+    const diagnostic = serverDiagnostics.get(server.name);
+    return {
+      server: server.name,
+      ok: diagnostic?.ok ?? false,
+      tools: diagnostic?.tools ?? 0,
+      message: diagnostic?.message ?? "not warmed yet"
+    };
+  });
+}
+
 async function withSession<T>(server: McpServerConfig, fn: (session: StdioMcpSession) => Promise<T>): Promise<T> {
   const session = new StdioMcpSession(server);
   try {
@@ -123,27 +224,8 @@ async function withSession<T>(server: McpServerConfig, fn: (session: StdioMcpSes
 
 export async function listMcpTools(state: ForgeState): Promise<McpToolDescriptor[]> {
   const tools: McpToolDescriptor[] = [];
-  for (const server of state.mcpServers || []) {
-    try {
-      const result = await withSession(server, async (session) =>
-        await withTimeout(
-          session.request("tools/list", {}),
-          MCP_LIST_TIMEOUT_MS,
-          () => `MCP tools/list timeout for ${server.name}.${session.errorContext()}`
-        )
-      );
-      const listed = Array.isArray(result?.tools) ? result.tools : [];
-      for (const tool of listed) {
-        tools.push({
-          server: server.name,
-          name: String(tool?.name || "").trim(),
-          description: tool?.description ? String(tool.description) : undefined,
-          inputSchema: tool?.inputSchema
-        });
-      }
-    } catch {
-      // Ignore unreachable servers during discovery.
-    }
+  for (const server of getEffectiveMcpServers(state)) {
+    tools.push(...await discoverServerTools(server));
   }
   return tools.filter((tool) => tool.name);
 }
@@ -154,7 +236,7 @@ export async function callMcpTool(
   toolName: string,
   args: Record<string, unknown>
 ): Promise<string> {
-  const server = (state.mcpServers || []).find((item) => item.name === serverName);
+  const server = getEffectiveMcpServers(state).find((item) => item.name === serverName);
   if (!server) throw new Error(`Unknown MCP server: ${serverName}`);
   const result = await withSession(server, async (session) =>
     await withTimeout(
