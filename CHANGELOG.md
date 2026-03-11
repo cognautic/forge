@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.13 - 2026-03-11
+- Fixed AI response stopping via Escape key:
+  - compositor now explicitly resumes `stdin` after pausing `readline` to ensure raw key events (ESC/Ctrl+C) are detected during AI turns
+  - improved abort reliability by eliminating the async gap where `stdin` was paused before the thinking-mode handler was fully armed
+
 ## 0.0.12 - 2026-03-09
 - Improved interactive chat UI:
   - MCP server warmup starts on load with compact status output

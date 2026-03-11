@@ -21,6 +21,8 @@ import {
 import { appendTurn, ChatSession, ChatTurn, createChat, renameChat, resolveChat } from "../core/chats";
 import { upsertChat } from "../core/chats";
 
+import { TerminalCompositor } from "./compositor";
+
 const USE_ANSI = Boolean(process.stdout.isTTY);
 const C = {
   reset: USE_ANSI ? "\x1b[0m" : "",
@@ -78,6 +80,7 @@ const COMMANDS = [
 ];
 
 export async function runInteractiveChat(initialState: ForgeState, opts?: { resume?: string }): Promise<void> {
+  const compositor = TerminalCompositor.getInstance();
   const workspace = await loadWorkspace(initialState.projectRoot);
   const resumed = opts?.resume ? await resolveChat(opts.resume) : null;
   const chat = resumed || (await createChat());
@@ -94,10 +97,8 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     historySize: 300,
     completer: (line: string) => completeLine(line, ctx)
   });
-  const stdinWasRaw = process.stdin.isTTY ? Boolean((process.stdin as NodeJS.ReadStream).isRaw) : false;
-  if (process.stdin.isTTY && !stdinWasRaw) {
-    (process.stdin as NodeJS.ReadStream).setRawMode(true);
-  }
+  compositor.setReadline(rl);
+  
   const pasteState: { mode: PasteMode } = { mode: "idle" };
   let suppressQueuedPasteLines = 0;
   let pendingTextPasteToken: string | null = null;
@@ -108,24 +109,89 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   let lastSubmittedInput = "";
   let lastSubmittedAt = 0;
   let currentPlan: { explanation?: string; steps: UiPlanStep[] } | null = null;
-  const onImagePasteKey = async (_str: string, key: { name?: string; ctrl?: boolean }) => {
-    if (!key?.ctrl || key.name !== "v") return;
-    if (imagePasteBusy || !process.stdin.isTTY) return;
-    imagePasteBusy = true;
-    try {
-      const pasted = await pasteImageFromClipboard(ctx.state.projectRoot);
-      if (!pasted) return;
-      pendingImagePastes.push(pasted);
-      const token = `[pasted image ${basename(pasted.path)}]`;
-      pendingAttachments.push({ token, kind: "image", text: pasted.path, mime: pasted.mime, bytes: pasted.bytes });
-      insertPlaceholderToken(rl, token, promptPrefix());
+
+  const onMasterKeypress = async (str: string, key: { name?: string; ctrl?: boolean; shift?: boolean; sequence?: string }) => {
+    // 1. Image Paste (Ctrl+V)
+    if (key?.ctrl && key?.name === "v") {
+      if (!imagePasteBusy && process.stdin.isTTY) {
+        imagePasteBusy = true;
+        try {
+          const pasted = await pasteImageFromClipboard(ctx.state.projectRoot);
+          if (pasted) {
+            pendingImagePastes.push(pasted);
+            const token = `[pasted image ${basename(pasted.path)}]`;
+            pendingAttachments.push({ token, kind: "image", text: pasted.path, mime: pasted.mime, bytes: pasted.bytes });
+            insertPlaceholderToken(rl, token, promptPrefix());
+            if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
+          }
+        } finally {
+          imagePasteBusy = false;
+        }
+      }
+      return;
+    }
+
+    // 2. YOLO Toggle (Ctrl+Y)
+    if (key?.ctrl && key?.name === "y") {
+      ctx.state = {
+        ...ctx.state,
+        executionMode: (ctx.state.executionMode || "safe") === "yolo" ? "safe" : "yolo"
+      };
+      await saveState(ctx.state);
+      process.stdout.write(`\nmode=${ctx.state.executionMode} (toggled via Ctrl+Y)\n`);
       if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
-    } finally {
-      imagePasteBusy = false;
+      return;
+    }
+
+    // 3. Mode Toggle (Shift+Tab)
+    if (key?.name === "tab" && key?.shift) {
+      shellMode = !shellMode;
+      process.stdout.write(`\ninput-mode=${shellMode ? "shell" : "chat"} (toggled via Shift+Tab)\n`);
+      if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
+      return;
+    }
+
+    // 4. PageUp -> Up
+    if (key?.name === "pageup") {
+      rl.write(null, { name: "up" });
+      return;
+    }
+
+    // 5. Esc/Ctrl+C Abort logic is now handled globally by the compositor in thinking mode.
+    // Here we just handle redraws and ghost redraws.
+
+    // 6. Ghost Suggestions & Autocomplete
+    if (!modalPromptActive && key?.name !== "return" && key?.name !== "enter") {
+      const line = rl.line || "";
+      const trimmed = line.trimStart();
+      const suffix = trimmed.startsWith("/") ? ghostSuffix(line, trimmed, ctx) : "";
+
+      // Accept suggestion using Right Arrow or End key.
+      if (suffix && (key?.name === "right" || key?.name === "enter")) {
+        const cursor = (rl as any).cursor ?? line.length;
+        if (cursor >= line.length) {
+          rl.write(suffix);
+          return;
+        }
+      }
+
+      // Live redraw with ghost text
+      const prompt = promptPrefix();
+      const cursor = Math.max(0, Math.min((rl as any).cursor ?? line.length, line.length));
+      const moveLeft = (line.length - cursor) + (suffix ? suffix.length : 0);
+      process.stdout.write("\r\x1b[2K");
+      if (suffix) {
+        process.stdout.write(`${prompt}${line}\x1b[90m${suffix}\x1b[0m`);
+        if (moveLeft > 0) process.stdout.write(`\x1b[${moveLeft}D`);
+      } else {
+        process.stdout.write(`${prompt}${line}`);
+        if (moveLeft > 0) process.stdout.write(`\x1b[${moveLeft}D`);
+      }
     }
   };
-  readline.emitKeypressEvents(process.stdin);
-  process.stdin.on("keypress", onImagePasteKey);
+
+  compositor.on("keypress", onMasterKeypress);
+
   const stopPasteIndicator = enablePasteIndicator(({ phase, chars, text, multiline, echoedRows, lineCount }) => {
     if (phase === "receiving_paste") {
       if (pasteState.mode === "idle") pasteState.mode = "receiving_paste";
@@ -145,31 +211,9 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     pendingAttachments.push({ token, kind: "text", text });
     insertPlaceholderToken(rl, token, promptPrefix());
     pasteState.mode = "idle";
-    // Readline may emit one line callback per pasted line plus a trailing empty submit.
     suppressQueuedPasteLines = Math.max(0, (lineCount ?? 0) + 1);
   });
-  const stopLiveSuggestions = enableLiveSuggestions(rl, ctx, promptPrefix);
-  const stopEscAbort = enableEscAbort(() => {
-    if (!activeTurnAbort || activeTurnAbort.signal.aborted) return;
-    activeTurnAbort.abort();
-    if (activeSpinner) activeSpinner.stop();
-    process.stdout.write("\n[stopping ai response...]\n");
-  }, () => Boolean(activeTurnAbort && !activeTurnAbort.signal.aborted));
-  const stopCtrlYToggle = enableCtrlYToggle(async () => {
-    ctx.state = {
-      ...ctx.state,
-      executionMode: (ctx.state.executionMode || "safe") === "yolo" ? "safe" : "yolo"
-    };
-    await saveState(ctx.state);
-    process.stdout.write(`\nmode=${ctx.state.executionMode} (toggled via Ctrl+Y)\n`);
-    if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
-  });
-  const stopShiftTabToggle = enableShiftTabToggle(() => {
-    shellMode = !shellMode;
-    process.stdout.write(`\ninput-mode=${shellMode ? "shell" : "chat"} (toggled via Shift+Tab)\n`);
-    if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
-  });
-  const stopPageUpHistory = enablePageUpHistory(rl);
+
   let autosaveInFlight: Promise<void> | null = null;
   const flushChat = async () => {
     if (!chatDirty) return;
@@ -301,6 +345,11 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
 
     try {
       rl.pause();
+      // Keep stdin flowing so ESC/Ctrl+C detection continues even while
+      // readline is paused (rl.pause() internally pauses process.stdin).
+      if (process.stdin.isTTY && process.stdin.isPaused()) {
+        process.stdin.resume();
+      }
       if (process.stdout.isTTY) {
         process.stdout.write("\x1b[1A\r\x1b[2K");
       }
@@ -313,6 +362,14 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       renderMessageBox("you", finalInput, "user");
 
       activeTurnAbort = new AbortController();
+      compositor.enterThinking(() => {
+        if (activeTurnAbort && !activeTurnAbort.signal.aborted) {
+          activeTurnAbort.abort();
+          if (activeSpinner) activeSpinner.stop();
+          process.stdout.write("\n[stopping ai response...]\n");
+        }
+      });
+
       const spinner = createSpinner("thinking...");
       activeSpinner = spinner;
       process.stdout.write("\r\x1b[2K");
@@ -382,15 +439,20 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
         });
         spinner.stop();
         process.stdout.write("\r\x1b[2K");
-        process.stdout.write(`${C.green}ai>${C.reset} ${C.white}${response}${C.reset}\n`);
-        await appendTurn(ctx.chat.id, "assistant", response);
-        ctx.chat.turns.push({ ts: new Date().toISOString(), role: "assistant", content: response });
-        ctx.sessionMemory.push({ ts: new Date().toISOString(), role: "assistant", content: response });
-        ctx.chat.updatedAt = new Date().toISOString();
-        chatDirty = true;
+        if (response === "Stopped.") {
+          process.stdout.write(`${C.yellow}ai stopped.${C.reset}\n`);
+        } else {
+          process.stdout.write(`${C.green}ai>${C.reset} ${C.white}${response}${C.reset}\n`);
+          await appendTurn(ctx.chat.id, "assistant", response);
+          ctx.chat.turns.push({ ts: new Date().toISOString(), role: "assistant", content: response });
+          ctx.sessionMemory.push({ ts: new Date().toISOString(), role: "assistant", content: response });
+          ctx.chat.updatedAt = new Date().toISOString();
+          chatDirty = true;
+        }
       } finally {
         spinner.stop();
         activeSpinner = null;
+        compositor.exitThinking();
       }
     } catch (err) {
       console.error(`error> ${err instanceof Error ? err.message : String(err)}`);
@@ -405,22 +467,9 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     process.stdout.write("\r\x1b[2K");
   }
   rl.close();
-  stopLiveSuggestions();
+  compositor.reset();
   stopPasteIndicator();
-  process.stdin.off("keypress", onImagePasteKey);
-  stopEscAbort();
-  stopCtrlYToggle();
-  stopShiftTabToggle();
-  stopPageUpHistory();
   clearInterval(autosaveTimer);
-  if (autosaveInFlight) await Promise.race([autosaveInFlight, sleepMs(1200)]);
-  if (chatDirty) await Promise.race([flushChat(), sleepMs(1200)]);
-  if (process.stdout.isTTY) {
-    process.stdout.write("\r\x1b[2K");
-  }
-  if (process.stdin.isTTY && !stdinWasRaw) {
-    (process.stdin as NodeJS.ReadStream).setRawMode(false);
-  }
   console.log(`to resume this chat use: forge resume ${ctx.chat.name}`);
 }
 
@@ -648,12 +697,12 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
   if (cmd === "/model") {
     const model = args.join(" ").trim();
     if (!model) {
-      process.stdout.write(`\r\x1b[2Kusage: /model <model-id>\n`);
+      console.log(`usage: /model <model-id>`);
       return false;
     }
     ctx.state = setProvider(ctx.state, { ...ctx.state.provider, model });
     await saveState(ctx.state);
-    process.stdout.write(`\r\x1b[2Kmodel set: ${model}\n`);
+    console.log(`model set: ${model}`);
     return false;
   }
 
@@ -1117,132 +1166,6 @@ function completeLine(line: string, ctx: ChatContext): [string[], string] {
   }
 
   return [[], current];
-}
-
-function enableLiveSuggestions(rl: readline.Interface, ctx: ChatContext, getPromptPrefix: () => string): () => void {
-  const input = process.stdin;
-  if (!input.isTTY) return () => {};
-
-  readline.emitKeypressEvents(input);
-  let lastGhostLen = 0;
-
-  const drawWithGhost = (line: string, suffix: string) => {
-    const prompt = getPromptPrefix();
-    const cursor = Math.max(0, Math.min((rl as any).cursor ?? line.length, line.length));
-    const moveLeft = (line.length - cursor) + (suffix ? suffix.length : 0);
-    process.stdout.write("\r\x1b[2K");
-    if (suffix) {
-      process.stdout.write(`${prompt}${line}\x1b[90m${suffix}\x1b[0m`);
-      if (moveLeft > 0) process.stdout.write(`\x1b[${moveLeft}D`);
-      lastGhostLen = suffix.length;
-      return;
-    }
-    process.stdout.write(`${prompt}${line}`);
-    if (moveLeft > 0) process.stdout.write(`\x1b[${moveLeft}D`);
-    if (lastGhostLen > 0) lastGhostLen = 0;
-  };
-
-  const onKeypress = (_str: string, key: { name?: string }) => {
-    if ((rl as any).__forgeModalPromptActive) return;
-    const line = rl.line || "";
-    const trimmed = line.trimStart();
-    const suffix = trimmed.startsWith("/") ? ghostSuffix(line, trimmed, ctx) : "";
-
-    // Accept suggestion using Right Arrow or End key.
-    if (suffix && (key?.name === "right" || key?.name === "end")) {
-      const cursor = (rl as any).cursor ?? line.length;
-      if (cursor >= line.length) {
-        rl.write(suffix);
-        return;
-      }
-    }
-
-    drawWithGhost(line, suffix);
-  };
-
-  input.on("keypress", onKeypress);
-  return () => input.off("keypress", onKeypress);
-}
-
-function enableEscAbort(onAbort: () => void, isAbortArmed: () => boolean): () => void {
-  const input = process.stdin;
-  if (!input.isTTY) return () => {};
-
-  readline.emitKeypressEvents(input);
-  let lastEscAt = 0;
-  const tryAbort = () => {
-    if (isAbortArmed()) {
-      lastEscAt = 0;
-      onAbort();
-      return true;
-    }
-    const now = Date.now();
-    if (now - lastEscAt < 650) {
-      lastEscAt = 0;
-      onAbort();
-      return true;
-    }
-    lastEscAt = now;
-    return false;
-  };
-  const onKeypress = (_str: string, key: { name?: string }) => {
-    if (key?.name !== "escape") return;
-    tryAbort();
-  };
-  const onData = (chunk: Buffer | string) => {
-    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    if (text === "\u001b") {
-      tryAbort();
-    }
-  };
-
-  input.on("keypress", onKeypress);
-  input.on("data", onData);
-  return () => {
-    input.off("keypress", onKeypress);
-    input.off("data", onData);
-  };
-}
-
-function enableCtrlYToggle(onToggle: () => void | Promise<void>): () => void {
-  const input = process.stdin;
-  if (!input.isTTY) return () => {};
-
-  readline.emitKeypressEvents(input);
-  const onKeypress = (_str: string, key: { name?: string; ctrl?: boolean }) => {
-    if (key?.ctrl && key?.name === "y") void onToggle();
-  };
-
-  input.on("keypress", onKeypress);
-  return () => input.off("keypress", onKeypress);
-}
-
-function enableShiftTabToggle(onToggle: () => void): () => void {
-  const input = process.stdin;
-  if (!input.isTTY) return () => {};
-
-  readline.emitKeypressEvents(input);
-  const onKeypress = (_str: string, key: { name?: string; shift?: boolean }) => {
-    if (key?.name === "tab" && key?.shift) onToggle();
-  };
-
-  input.on("keypress", onKeypress);
-  return () => input.off("keypress", onKeypress);
-}
-
-function enablePageUpHistory(rl: readline.Interface): () => void {
-  const input = process.stdin;
-  if (!input.isTTY) return () => {};
-
-  readline.emitKeypressEvents(input);
-  const onKeypress = (_str: string, key: { name?: string }) => {
-    if (key?.name === "pageup") {
-      rl.write(null, { name: "up" });
-    }
-  };
-
-  input.on("keypress", onKeypress);
-  return () => input.off("keypress", onKeypress);
 }
 
 function enablePasteIndicator(

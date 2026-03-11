@@ -277,7 +277,7 @@ export async function runAiTurn(
     if (!signal?.aborted) opts?.onToolCall?.(parsed.tool, parsed.args || {});
     let toolResult = "";
     try {
-      toolResult = await executeTool(state, parsed, opts);
+      toolResult = await executeTool(state, parsed, { ...opts, signal });
     } catch (err: any) {
       if (signal?.aborted || err?.name === "AbortError") throw err;
       const message = err instanceof Error ? err.message : String(err);
@@ -301,10 +301,20 @@ async function executeTool(
   state: ForgeState,
   call: ToolCall,
   opts?: {
+    signal?: AbortSignal;
     onUserWait?: (request: { reason: string; prompt?: string; timeoutSeconds?: number | null }) => Promise<string>;
   }
 ): Promise<string> {
   const args = call.args || {};
+  const signal = opts?.signal;
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      const err = new Error("Aborted");
+      (err as any).name = "AbortError";
+      throw err;
+    }
+  };
+
   if (call.tool === "user.wait") {
     const reason = String(args.reason || "").trim();
     const prompt = String(args.prompt || "").trim();
@@ -319,7 +329,11 @@ async function executeTool(
       });
     }
     if (timeoutSeconds) {
-      await sleep(timeoutSeconds * 1000);
+      const start = Date.now();
+      while (Date.now() - start < timeoutSeconds * 1000) {
+        throwIfAborted();
+        await sleep(Math.min(1000, (timeoutSeconds * 1000) - (Date.now() - start)));
+      }
       return `waited ${timeoutSeconds}s for manual user action: ${reason}`;
     }
     return `manual user action required: ${reason}`;
@@ -346,7 +360,7 @@ async function executeTool(
     return result.success ? JSON.stringify(result.data) : `google_error(${toolName}): ${result.error}`;
   }
   if (call.tool.startsWith("browser.")) {
-    return await executeBrowserToolWithRecovery(state, call.tool, args);
+    return await executeBrowserToolWithRecovery(state, call.tool, args, signal);
   }
 
   if (call.tool === "browser.launch") {
@@ -508,7 +522,7 @@ async function executeTool(
     let lastError = "";
 
     const liteUrl = `https://lite.duckduckgo.com/lite/?${new URLSearchParams({ q: query }).toString()}`;
-    const liteRes = await fetchWithUa(liteUrl);
+    const liteRes = await fetchWithUa(liteUrl, signal);
     if (liteRes.ok) {
       const lite = await liteRes.text();
         items = extractDuckDuckGoResults(lite).slice(0, 10);
@@ -520,7 +534,7 @@ async function executeTool(
 
     if (!items.length) {
       const htmlUrl = `https://duckduckgo.com/html/?${new URLSearchParams({ q: query }).toString()}`;
-      const htmlRes = await fetchWithUa(htmlUrl);
+      const htmlRes = await fetchWithUa(htmlUrl, signal);
       if (htmlRes.ok) {
         const html = await htmlRes.text();
         items = extractDuckDuckGoResults(html).slice(0, 10);
@@ -539,7 +553,7 @@ async function executeTool(
         no_redirect: "1",
         skip_disambig: "1"
       }).toString()}`;
-      const apiRes = await fetchWithUa(apiUrl);
+      const apiRes = await fetchWithUa(apiUrl, signal);
       if (apiRes.ok) {
         const apiJson = await apiRes.json();
         items = extractDuckDuckGoApiResults(apiJson).slice(0, 10);
@@ -565,6 +579,7 @@ async function executeTool(
     }
     if (!/^https?:$/.test(parsed.protocol)) return "web.read failed: only http/https urls are allowed";
     const res = await fetch(parsed.toString(), {
+      signal,
       headers: {
         "user-agent":
           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -580,7 +595,7 @@ async function executeTool(
     if (!command) return "missing command";
     const blocked = blockedCommandMessage(commandProgram(command));
     if (blocked) return blocked;
-    const r = await runCommand(command, state.projectRoot);
+    const r = await runCommand(command, state.projectRoot, signal);
     return `exit=${r.code}\n${r.output.slice(0, 1200)}`;
   }
 
@@ -589,7 +604,7 @@ async function executeTool(
     if (!command) return "missing command";
     const blocked = blockedCommandMessage(commandProgram(command));
     if (blocked) return blocked;
-    const r = await runCommand(command, state.projectRoot);
+    const r = await runCommand(command, state.projectRoot, signal);
     return `exit=${r.code}\n${r.output.slice(0, 1200)}`;
   }
 
@@ -618,7 +633,7 @@ async function executeTool(
     const command = String(args.command || "echo missing command");
     const blocked = blockedCommandMessage(commandProgram(command));
     if (blocked) return blocked;
-    const r = await runCommand(command, state.projectRoot);
+    const r = await runCommand(command, state.projectRoot, signal);
     return `exit=${r.code}\n${r.output.slice(0, 1200)}`;
   }
 
@@ -628,7 +643,7 @@ async function executeTool(
     if (!program) return "missing program";
     const blocked = blockedCommandMessage(program);
     if (blocked) return blocked;
-    const r = await runCommandDirect(program, argv, state.projectRoot);
+    const r = await runCommandDirect(program, argv, state.projectRoot, signal);
     return `exit=${r.code}\n${r.output.slice(0, 1200)}`;
   }
 
@@ -638,9 +653,18 @@ async function executeTool(
 async function executeBrowserToolWithRecovery(
   state: ForgeState,
   tool: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  signal?: AbortSignal
 ): Promise<string> {
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      const err = new Error("Aborted");
+      (err as any).name = "AbortError";
+      throw err;
+    }
+  };
   const run = async () => {
+    throwIfAborted();
     if (tool === "browser.launch") {
       await launchBrowser(".forge-data/browser", state.browserExecutablePath);
       return "browser launched";
@@ -1086,8 +1110,9 @@ async function waitForWebSearchSlot(): Promise<void> {
   lastWebSearchAt = Date.now();
 }
 
-async function fetchWithUa(url: string): Promise<Response> {
+async function fetchWithUa(url: string, signal?: AbortSignal): Promise<Response> {
   return await fetch(url, {
+    signal,
     headers: {
       "user-agent":
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"

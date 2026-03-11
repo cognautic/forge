@@ -2,18 +2,19 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, delimiter, join } from "node:path";
 
-export async function runCommand(cmd: string, cwd: string): Promise<{ code: number; output: string }> {
+export async function runCommand(cmd: string, cwd: string, signal?: AbortSignal): Promise<{ code: number; output: string }> {
   const [program, ...args] = splitCommand(cmd);
   if (!program) {
     return { code: 1, output: "No command provided" };
   }
-  return runCommandDirect(program, args, cwd);
+  return runCommandDirect(program, args, cwd, signal);
 }
 
 export async function runCommandDirect(
   program: string,
   args: string[],
-  cwd: string
+  cwd: string,
+  signal?: AbortSignal
 ): Promise<{ code: number; output: string }> {
   const safeCwd = resolveCwd(cwd);
   const env = buildEnvWithSbin(process.env);
@@ -22,7 +23,7 @@ export async function runCommandDirect(
 
   for (const bin of candidates) {
     try {
-      const result = await runSpawn(bin, args, safeCwd, env);
+      const result = await runSpawn(bin, args, safeCwd, env, signal);
       if (safeCwd !== cwd) {
         return { ...result, output: `[warn] cwd missing, used ${safeCwd}\n${result.output}` };
       }
@@ -59,14 +60,16 @@ function runSpawn(
   bin: string,
   args: string[],
   cwd: string,
-  env: NodeJS.ProcessEnv
+  env: NodeJS.ProcessEnv,
+  signal?: AbortSignal
 ): Promise<{ code: number; output: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
       cwd,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
-      env
+      env,
+      signal
     });
 
     let out = "";
@@ -81,8 +84,25 @@ function runSpawn(
       process.stderr.write(t);
     });
 
-    child.on("error", reject);
+    child.on("error", (err) => {
+      if (err.name === "AbortError") {
+        resolve({ code: 130, output: out + "\n[command aborted]" });
+      } else {
+        reject(err);
+      }
+    });
     child.on("close", (code) => resolve({ code: code ?? 1, output: out.slice(0, 12000) }));
+
+    if (signal) {
+      if (signal.aborted) {
+        child.kill();
+        resolve({ code: 130, output: out + "\n[command aborted]" });
+      } else {
+        signal.addEventListener("abort", () => {
+          child.kill();
+        }, { once: true });
+      }
+    }
   });
 }
 

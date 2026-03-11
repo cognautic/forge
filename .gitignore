@@ -24,6 +24,7 @@ convex/
 # Secrets and local env
 .env
 .env.*
+bun.lock
 !.env.example
 .forge/
 # OS/editor files
