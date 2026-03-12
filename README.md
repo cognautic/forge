@@ -139,6 +139,8 @@ Co-worker workspace:
 - `/timeline`
 - `/roles show`
 - `/roles set <architect|planner|executor|reviewer|memory_manager> <owner>`
+- `/skill add <path/to/SKILL.md>`
+- `/skill list`
 
 Autocomplete / ghost suggestions:
 

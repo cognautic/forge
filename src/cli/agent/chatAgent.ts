@@ -38,6 +38,10 @@ export async function runAiTurn(
   userInput: string,
   opts?: {
     signal?: AbortSignal;
+    skillsContext?: string;
+    skillsFiles?: {
+      globalAbsolute?: string[];
+    };
     workspaceContext?: string;
     memoryContext?: string;
     confirmAction?: (tool: string, args: Record<string, unknown>) => Promise<boolean>;
@@ -51,6 +55,10 @@ export async function runAiTurn(
   const mcpTools = await listMcpTools(state);
   const googleTools = getAllGoogleTools();
   const signal = opts?.signal;
+  const skillsContext = opts?.skillsContext || "(none)";
+  const globalSkillFiles = (opts?.skillsFiles?.globalAbsolute || [])
+    .map((p) => String(p || "").trim())
+    .filter(Boolean);
   const workspaceContext = opts?.workspaceContext || "Workspace context unavailable.";
   const memoryContext = opts?.memoryContext || "Memory unavailable.";
   const throwIfAborted = () => {
@@ -77,6 +85,8 @@ export async function runAiTurn(
     `Current system ISO timestamp: ${now.toISOString()}`,
     `Execution mode: ${state.executionMode || "safe"} (safe=request confirmation before each action; yolo=auto-execute all actions).`,
     "Operate as a structured co-worker with internal roles: Architect -> Planner -> Executor -> Reviewer -> Memory Manager.",
+    "Before taking any action, read the entire Skills section(s) (if present) and follow them as mandatory instructions.",
+    "If the user request appears to match an available skill (e.g. design/redesign/UI/UX), you MUST read the relevant skill file(s) via files.read before starting the work.",
     "Use memory context to continue prior work when user asks to continue/resume/finish.",
     "Do not ask for task clarification if memory contains a clear last intent; continue from memory first.",
     "Before acting, infer the active task and lifecycle stage: Proposed/Approved/In Progress/Under Review/Completed/Archived.",
@@ -197,6 +207,10 @@ export async function runAiTurn(
     "- If command missing, try alternative tools/commands and report what worked.",
     `Search intent for this user message: ${searchIntent ? "yes" : "no"}`,
     `System info: ${JSON.stringify(osInfo)}`,
+    "Skill files (global, absolute):",
+    ...(globalSkillFiles.length ? globalSkillFiles : ["(none)"]),
+    "Skills snapshot:",
+    skillsContext,
     "Workspace snapshot:",
     workspaceContext,
     "Memory snapshot:",
@@ -205,6 +219,17 @@ export async function runAiTurn(
 
   let context = `${system}\n\nUser: ${userInput}\n`;
   let stepsSinceFollowUp = 0;
+  const pendingSkillReads = new Set<string>();
+  const shouldReadDesignSkills = /\b(design|redesign|ui|ux|website|landing\s*page|css|layout|typography|brand)\b/i.test(userInput);
+  if (shouldReadDesignSkills && globalSkillFiles.length) {
+    for (const p of globalSkillFiles) {
+      const lower = p.toLowerCase();
+      if (lower.includes("design") || lower.includes("ui") || lower.includes("ux") || lower.includes("frontend") || lower.includes("css")) {
+        pendingSkillReads.add(p);
+      }
+    }
+  }
+
   for (let i = 0; ; i++) {
     throwIfAborted();
     opts?.onStatus?.(`thinking (step ${i + 1})`);
@@ -240,6 +265,31 @@ export async function runAiTurn(
     if (parsed.type === "message") {
       context += `\nProtocol note: do not send plain messages. Use tools and end with finish_response.\n`;
       continue;
+    }
+
+    if (pendingSkillReads.size) {
+      if (parsed.tool !== "files.read") {
+        context += `\nSkill enforcement: before calling ${parsed.tool}, you MUST read the relevant skill file(s) first using files.read on each of these paths:\n${[
+          ...pendingSkillReads
+        ].join("\n")}\n`;
+        continue;
+      }
+      const requested = String(parsed.args?.path || "").trim();
+      if (!requested || !pendingSkillReads.has(requested)) {
+        context += `\nSkill enforcement: files.read must target one of the required skill paths exactly. Remaining:\n${[
+          ...pendingSkillReads
+        ].join("\n")}\n`;
+        continue;
+      }
+      // Record that the model actually read the skill, and include the content in context.
+      let data = "";
+      try {
+        data = await readWorkspaceFile(state.projectRoot, requested);
+      } catch (err) {
+        data = `files.read failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+      pendingSkillReads.delete(requested);
+      context += `\nSkill read (${requested}):\n${String(data).slice(0, 4000)}\n`;
     }
 
     if (parsed.tool === "finish_response") {

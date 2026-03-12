@@ -10,6 +10,12 @@ import { runCommand } from "../terminal/exec";
 import { getEffectiveMcpServers, getMcpDiagnostics, listMcpTools, prewarmMcpServers } from "../mcp/client";
 import { GoogleIntegration } from "../../integrations/google";
 import {
+  installSkillFromFile,
+  listInstalledSkills,
+  loadSkillsContext,
+  resolveSkillSourcePath
+} from "../core/skills";
+import {
   addArtifact,
   addTask,
   loadWorkspace,
@@ -17,6 +23,7 @@ import {
   setObjective,
   setRoleOwner,
   setTaskStatus,
+  workspaceDigest,
 } from "../core/cowork";
 import { appendTurn, ChatSession, ChatTurn, createChat, renameChat, resolveChat } from "../core/chats";
 import { upsertChat } from "../core/chats";
@@ -66,6 +73,7 @@ const COMMANDS = [
   "/browserpath",
   "/searchmode",
   "/config",
+  "/skill",
   "/objective",
   "/task",
   "/artifact",
@@ -376,9 +384,15 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       spinner.start();
       const toolDivider = `${C.dim}${"-".repeat(72)}${C.reset}\n`;
       try {
+        const skillsContext = await loadSkillsContext(ctx.state.projectRoot);
+        const globalSkillFiles = (await listInstalledSkills(ctx.state.projectRoot)).global.map((s) => s.path);
         const response = await runAiTurn(ctx.state, finalInput, {
           signal: activeTurnAbort.signal,
-          workspaceContext: "Session-only mode: no global workspace context.",
+          skillsContext,
+          skillsFiles: {
+            globalAbsolute: globalSkillFiles
+          },
+          workspaceContext: workspaceDigest(ctx.workspace),
           memoryContext: sessionMemoryDigest(ctx.sessionMemory),
           confirmAction: async (tool, args) => {
             if ((ctx.state.executionMode || "safe") === "yolo") return true;
@@ -399,6 +413,12 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
           onStatus: (status) => spinner.setLabel(`ai ${status}`),
           onToolCall: (tool, args) => {
             spinner.pause();
+            if (tool === "files.read") {
+              const path = String((args as any)?.path || "").trim();
+              if (path && globalSkillFiles.includes(path)) {
+                spinner.setLabel(`reading ${path} skill file`);
+              }
+            }
             process.stdout.write(`\n${toolDivider}`);
             process.stdout.write(`${C.cyan}• Ran${C.reset} ${formatToolCall(tool, args)}\n${C.gray}  └${C.reset}\n`);
             spinner.resume();
@@ -657,6 +677,40 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
 
   if (cmd === "/config") {
     await runConfigWizard(rl, ctx);
+    return false;
+  }
+
+  if (cmd === "/skill") {
+    const sub = (args[0] || "").trim().toLowerCase();
+    if (!sub || sub === "list") {
+      const installed = await listInstalledSkills(ctx.state.projectRoot);
+      if (!installed.global.length) {
+        console.log("(no skills installed)");
+        return false;
+      }
+      console.log("global skills:");
+      for (const sk of installed.global) console.log(`- ${sk.name} (${sk.path})`);
+      return false;
+    }
+    if (sub === "add") {
+      const rawPath = args.slice(1).join(" ").trim();
+      const sourcePath = resolveSkillSourcePath(ctx.state.projectRoot, rawPath);
+      if (!sourcePath) {
+        console.log("usage: /skill add <path/to/SKILL.md>");
+        return false;
+      }
+      try {
+        const installed = await installSkillFromFile({
+          projectRoot: ctx.state.projectRoot,
+          sourcePath
+        });
+        console.log(`skill installed: ${installed.name} -> ${installed.destPath} (${installed.bytes} bytes)`);
+      } catch (err) {
+        console.log(`skill install failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return false;
+    }
+    console.log("usage: /skill add <path/to/SKILL.md> OR /skill list");
     return false;
   }
 
@@ -1104,6 +1158,9 @@ function completeLine(line: string, ctx: ChatContext): [string[], string] {
   if (trimmed === "/memory" || trimmed === "/memory ") {
     return [["show", "clear"], ""];
   }
+  if (trimmed === "/skill" || trimmed === "/skill ") {
+    return [["add", "list"], ""];
+  }
   if (trimmed === "/mcp" || trimmed === "/mcp ") {
     return [["list", "tools", "add", "remove"], ""];
   }
@@ -1151,6 +1208,9 @@ function completeLine(line: string, ctx: ChatContext): [string[], string] {
   }
   if (tokens[0] === "/memory" && tokens.length === 2) {
     return [["show", "clear"].filter((v) => v.startsWith(current)), current];
+  }
+  if (tokens[0] === "/skill" && tokens.length === 2) {
+    return [["add", "list"].filter((v) => v.startsWith(current)), current];
   }
   if (tokens[0] === "/mcp" && tokens.length === 2) {
     return [["list", "tools", "add", "remove"].filter((v) => v.startsWith(current)), current];
@@ -1406,6 +1466,7 @@ function printHelp(): void {
     "/browserpath </usr/sbin/brave>",
     "/searchmode <safe|manual>",
     "/config (interactive selectable setup)",
+    "/skill add <path/to/SKILL.md> | /skill list",
     "/mode <safe|yolo>",
     "/yolo [on|off|toggle] (shortcut: Ctrl+Y)",
     "/root <path>",

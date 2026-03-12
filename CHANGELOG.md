@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.14 - 2026-03-12
+- Added global skills support:
+  - `/skill add <path/to/SKILL.md>` installs a skill into `~/.config/cognautic-forge/skills/<name>/SKILL.md` (supports `~/...` paths)
+  - `/skill list` shows installed skills
+- Updated agent behavior around skills:
+  - system prompt lists installed skill files
+  - for design/redesign/UI/UX-type requests, the AI is forced to `files.read` relevant skill files before starting work
+- Updated chat spinner label to show `reading <skill> skill file` during those skill reads
+
 ## 0.0.13 - 2026-03-11
 - Fixed AI response stopping via Escape key:
   - compositor now explicitly resumes `stdin` after pausing `readline` to ensure raw key events (ESC/Ctrl+C) are detected during AI turns
