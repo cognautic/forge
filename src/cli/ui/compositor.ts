@@ -13,6 +13,9 @@ export class TerminalCompositor extends EventEmitter {
   private activeAbort: (() => void) | null = null;
   private _thinking = false;
   private rl: readline.Interface | null = null;
+  private stdinDataHandler: ((chunk: Buffer) => void) | null = null;
+  private stdinKeypressHandler: ((str: string, key: any) => void) | null = null;
+  private sigintHandler: (() => void) | null = null;
 
   private constructor() {
     super();
@@ -43,7 +46,7 @@ export class TerminalCompositor extends EventEmitter {
 
     readline.emitKeypressEvents(process.stdin);
 
-    process.stdin.on("data", (chunk: Buffer) => {
+    this.stdinDataHandler = (chunk: Buffer) => {
       const text = chunk.toString("utf8");
       
       // Raw Escape (\u001b) or Ctrl+C (\u0003)
@@ -55,9 +58,10 @@ export class TerminalCompositor extends EventEmitter {
       }
 
       this.emit("data", chunk);
-    });
+    };
+    process.stdin.on("data", this.stdinDataHandler);
 
-    process.stdin.on("keypress", (str: string, key: any) => {
+    this.stdinKeypressHandler = (str: string, key: any) => {
       // Named keys from readline's parser
       if (key?.name === "escape" || (key?.ctrl && key?.name === "c") || key?.sequence === "\u001b" || key?.sequence === "\u0003") {
         if (this._thinking && this.activeAbort) {
@@ -66,17 +70,19 @@ export class TerminalCompositor extends EventEmitter {
         }
       }
       this.emit("keypress", str, key);
-    });
+    };
+    process.stdin.on("keypress", this.stdinKeypressHandler);
 
     // Handle process signals
-    process.on("SIGINT", () => {
+    this.sigintHandler = () => {
       if (this._thinking && this.activeAbort) {
         this.activeAbort();
       } else {
         this.reset();
         process.exit(0);
       }
-    });
+    };
+    process.on("SIGINT", this.sigintHandler);
   }
 
   /**
@@ -108,6 +114,30 @@ export class TerminalCompositor extends EventEmitter {
   }
 
   public reset() {
+    if (this.stdinDataHandler) {
+      try {
+        process.stdin.off("data", this.stdinDataHandler);
+      } catch {
+        // ignore
+      }
+      this.stdinDataHandler = null;
+    }
+    if (this.stdinKeypressHandler) {
+      try {
+        process.stdin.off("keypress", this.stdinKeypressHandler);
+      } catch {
+        // ignore
+      }
+      this.stdinKeypressHandler = null;
+    }
+    if (this.sigintHandler) {
+      try {
+        process.off("SIGINT", this.sigintHandler);
+      } catch {
+        // ignore
+      }
+      this.sigintHandler = null;
+    }
     if (this.isRaw && process.stdin.isTTY) {
       try {
         process.stdin.setRawMode(false);

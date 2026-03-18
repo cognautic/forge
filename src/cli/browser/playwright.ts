@@ -1,10 +1,11 @@
-import { chromium, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 let context: BrowserContext | null = null;
 let page: Page | null = null;
+let browser: Browser | null = null;
 let overlayEnabled = true;
 let aiCursorX = 120;
 let aiCursorY = 120;
@@ -26,6 +27,21 @@ export async function launchBrowser(
   userDataDir = ".forge-data/browser",
   executablePath?: string
 ): Promise<void> {
+  // Optionally attach to an existing Chrome/Chromium instance via CDP.
+  // This requires the browser to be launched with remote debugging enabled, e.g.:
+  //   google-chrome --remote-debugging-port=9222
+  const cdpUrl = String(process.env.FORGE_BROWSER_CDP_URL || "").trim();
+  if (cdpUrl) {
+    if (!context) {
+      browser = await chromium.connectOverCDP(cdpUrl);
+      const existing = browser.contexts()[0];
+      context = existing ?? (await browser.newContext());
+      attachContextObservers(context);
+      page = context.pages()[0] ?? (await context.newPage());
+      return;
+    }
+  }
+
   launchUserDataDir = resolveLaunchUserDataDir(userDataDir, executablePath);
   launchExecutablePath = executablePath || undefined;
 
@@ -53,8 +69,14 @@ export async function resetBrowser(): Promise<void> {
   } catch {
     // best effort reset
   }
+  try {
+    await browser?.close();
+  } catch {
+    // best effort reset
+  }
   context = null;
   page = null;
+  browser = null;
   lastPageSnapshot = null;
   pendingDialogMessages = [];
 }
@@ -64,6 +86,10 @@ async function launchContextOrThrow(userDataDir: string, executablePath?: string
     const launched = await chromium.launchPersistentContext(userDataDir, {
       headless: false,
       executablePath,
+      // Prefer Chromium sandbox (avoids the "--no-sandbox" warning banner).
+      // Some environments (e.g. root without proper sandbox support) may require disabling it,
+      // in which case we retry below.
+      chromiumSandbox: true,
       ignoreDefaultArgs: ["--enable-automation"],
       args: [
         "--disable-blink-features=AutomationControlled",
@@ -79,6 +105,26 @@ async function launchContextOrThrow(userDataDir: string, executablePath?: string
     return launched;
   } catch (err) {
     const msg = String((err as Error)?.message || err || "");
+    // Retry without sandbox if the environment doesn't support it.
+    if (/sandbox/i.test(msg) || /No usable sandbox/i.test(msg) || /zygote/i.test(msg)) {
+      const launched = await chromium.launchPersistentContext(userDataDir, {
+        headless: false,
+        executablePath,
+        chromiumSandbox: false,
+        ignoreDefaultArgs: ["--enable-automation"],
+        args: [
+          "--disable-blink-features=AutomationControlled",
+          "--no-default-browser-check",
+          "--disable-dev-shm-usage"
+        ]
+      });
+      await launched.addInitScript(() => {
+        Object.defineProperty(navigator, "webdriver", {
+          get: () => undefined
+        });
+      });
+      return launched;
+    }
     if (/Executable doesn't exist at/i.test(msg) || /playwright install/i.test(msg)) {
       if (executablePath) {
         throw new Error(
@@ -94,9 +140,16 @@ async function launchContextOrThrow(userDataDir: string, executablePath?: string
 }
 
 function resolveLaunchUserDataDir(defaultUserDataDir: string, executablePath?: string): string {
-  if (!executablePath) return defaultUserDataDir;
-  const detected = detectInstalledBrowserUserDataDir(executablePath);
-  return detected || defaultUserDataDir;
+  // Always prefer an isolated Forge profile directory to avoid profile-lock
+  // conflicts when the user already has their browser open.
+  //
+  // Opt-in to using the system browser profile (may conflict with an existing
+  // running browser) by setting FORGE_BROWSER_USE_SYSTEM_PROFILE=1.
+  if (process.env.FORGE_BROWSER_USE_SYSTEM_PROFILE === "1" && executablePath) {
+    const detected = detectInstalledBrowserUserDataDir(executablePath);
+    return detected || defaultUserDataDir;
+  }
+  return defaultUserDataDir;
 }
 
 function detectInstalledBrowserUserDataDir(executablePath: string): string | null {

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.0.15 - 2026-03-18
+- Rebuilt interactive chat UI as a true fullscreen compositor (alternate screen buffer):
+  - fixed header rendered into scrollback so output pushes it away naturally
+  - scrollable output pane with PageUp/PageDown and mouse wheel
+  - stable input box rendering with in-line cursor cell (terminal cursor hidden)
+  - command suggestion UI: selectable list under input for slash commands (Up/Down, Tab/Right to insert)
+  - `?` shows a shortcuts panel (Shift+Tab, Ctrl+Y, Ctrl+V, scrolling, stop)
+  - YOLO mode prompt marker switches to a red `*`
+  - AI response animation while responding, plus better stop behavior
+  - fixed mouse escape sequences leaking into input by stripping SGR/X10 mouse sequences at the byte level
+- Fixed shutdown/terminal restore issues:
+  - compositor now unregisters its stdin/SIGINT handlers on reset
+  - interactive chat cleans up timers and raw-mode state to return shell prompt cleanly
+- Browser tool reliability improvements:
+  - avoid profile-lock crashes by defaulting to Forge’s isolated profile directory (opt-in system profile via `FORGE_BROWSER_USE_SYSTEM_PROFILE=1`)
+  - added CDP attach support via `FORGE_BROWSER_CDP_URL` to reuse an already-running browser
+  - prefer Chromium sandbox to remove the `--no-sandbox` warning banner (auto-retry without sandbox when required)
+
 ## 0.0.14 - 2026-03-12
 - Added global skills support:
   - `/skill add <path/to/SKILL.md>` installs a skill into `~/.config/cognautic-forge/skills/<name>/SKILL.md` (supports `~/...` paths)

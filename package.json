@@ -1,6 +1,6 @@
 {
   "name": "@cognautic.space/forge",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "private": false,
   "type": "commonjs",
   "description": "Cognautic Forge - local-first AI co-worker CLI",

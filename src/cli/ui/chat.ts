@@ -2,6 +2,7 @@ import * as readline from "node:readline";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { PassThrough, Writable } from "node:stream";
 import type { CoworkRole, ForgeState, ProviderKind, TaskStatus } from "../types";
 import { saveState } from "../core/state";
 import { PROVIDERS, fetchModels, setApiKeyInConfig, setProvider } from "../providers/manager";
@@ -42,6 +43,8 @@ const C = {
   white: USE_ANSI ? "\x1b[97m" : "",
   underline: USE_ANSI ? "\x1b[4m" : ""
 } as const;
+
+let uiRenderInProgress = false;
 
 interface ChatContext {
   state: ForgeState;
@@ -87,6 +90,53 @@ const COMMANDS = [
   "/clear"
 ];
 
+const COMMAND_DESCRIPTIONS: Record<string, string> = {
+  "/help": "show available commands",
+  "/exit": "exit Forge",
+  "/status": "show current status",
+  "/providers": "list providers",
+  "/provider": "set provider",
+  "/models": "list/refresh models",
+  "/model": "set model",
+  "/apikey": "set provider API key",
+  "/mode": "set execution mode",
+  "/yolo": "toggle YOLO mode",
+  "/root": "set project root",
+  "/endpoint": "set custom endpoint",
+  "/browserpath": "set browser executable path",
+  "/searchmode": "set search mode",
+  "/config": "interactive setup",
+  "/skill": "add/list skills",
+  "/objective": "set/show objective",
+  "/task": "manage tasks",
+  "/artifact": "manage artifacts",
+  "/timeline": "show timeline",
+  "/roles": "show/set roles",
+  "/memory": "show/clear memory",
+  "/mcp": "manage MCP servers/tools",
+  "/auth": "authenticate integrations",
+  "/logout": "logout integrations",
+  "/rename": "rename current chat",
+  "/clear": "clear the screen"
+};
+
+const FORGE_LOGO_SOURCE = [
+  "    ██████████████████████████████    ",
+  "    ██████████████████████████████    ",
+  "    ██████████████████████████████    ",
+  "██████████                  ██████    ",
+  "██████████ ██████    ██████ ██████████",
+  "██████████ ██████    ██████ ██████████",
+  "██████████ ██████    ██████ ██████████",
+  "██████████                  ██████████",
+  "██████████                  ██████████",
+  "    ██████████████████████████████    ",
+  "    ██████████████████████████████    ",
+  "    ██████████████████████████████    ",
+  "           ██████    ██████           ",
+  "           ██████    ██████           "
+];
+
 export async function runInteractiveChat(initialState: ForgeState, opts?: { resume?: string }): Promise<void> {
   const compositor = TerminalCompositor.getInstance();
   const workspace = await loadWorkspace(initialState.projectRoot);
@@ -97,14 +147,110 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   let activeSpinner: { stop: () => void } | null = null;
   let chatDirty = false;
   let shellMode = false;
-  const promptPrefix = () => (shellMode ? "sh> " : "you> ");
+  const promptMode = () => (shellMode ? "shell" : "chat");
 
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
+  const rawStdoutWrite = process.stdout.write.bind(process.stdout);
+  const rawConsoleLog = console.log.bind(console);
+  const rawConsoleError = console.error.bind(console);
+  let rl!: readline.Interface;
+
+  const outputLines: string[] = [];
+  const OUTPUT_MAX_LINES = 5000;
+  let outputCarry = "";
+  let renderScheduled = false;
+  let fullscreenActive = false;
+  let scrollOffset = 0; // 0 = bottom (latest)
+  let aiThinking = false;
+  let thinkingTimer: NodeJS.Timeout | null = null;
+  let thinkingFrame = 0;
+  const THINK_FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+  let suggestionSelected = 0;
+  const rlInput = new PassThrough();
+  let mouseCarry: Buffer | null = null;
+
+  const scheduleRender = () => {
+    if (!process.stdout.isTTY) return;
+    if (!fullscreenActive) return;
+    if (renderScheduled) return;
+    renderScheduled = true;
+    setImmediate(() => {
+      renderScheduled = false;
+      renderScreen();
+    });
+  };
+
+  const setThinking = (on: boolean) => {
+    aiThinking = on;
+    if (!process.stdout.isTTY) return;
+    if (!fullscreenActive) return;
+    if (thinkingTimer) {
+      clearInterval(thinkingTimer);
+      thinkingTimer = null;
+    }
+    if (on) {
+      thinkingTimer = setInterval(() => {
+        thinkingFrame = (thinkingFrame + 1) % THINK_FRAMES.length;
+        scheduleRender();
+      }, 80);
+      // Don't keep the process alive just for the animation timer.
+      (thinkingTimer as any).unref?.();
+    } else {
+      thinkingFrame = 0;
+      scheduleRender();
+    }
+  };
+
+  const appendOutput = (text: string) => {
+    if (!text) return;
+    const combined = outputCarry + text;
+    const parts = combined.split(/\r?\n/);
+    outputCarry = parts.pop() ?? "";
+    for (const line of parts) outputLines.push(line);
+    while (outputLines.length > OUTPUT_MAX_LINES) outputLines.shift();
+    // If user is not at tail, keep their view anchored as new lines arrive.
+    if (scrollOffset > 0) scrollOffset = Math.min(scrollOffset + parts.length, OUTPUT_MAX_LINES);
+    scheduleRender();
+  };
+
+  const enterFullscreen = () => {
+    if (!process.stdout.isTTY || fullscreenActive) return;
+    fullscreenActive = true;
+    // Alternate screen + clear + hide cursor + disable wrap + enable mouse wheel reporting.
+    // Mouse: 1000 (normal tracking) + 1006 (SGR extended). Many terminals emit wheel as SGR.
+    rawStdoutWrite("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h");
+  };
+
+  const exitFullscreen = () => {
+    if (!process.stdout.isTTY || !fullscreenActive) return;
+    fullscreenActive = false;
+    // Enable wrap + show cursor + leave alternate screen.
+    rawStdoutWrite("\x1b[?1000l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l");
+  };
+
+  const rlOutput = new (class extends Writable {
+    public muted = true;
+    _write(chunk: any, _enc: BufferEncoding, cb: (error?: Error | null) => void) {
+      if (!this.muted) rawStdoutWrite(chunk);
+      cb();
+    }
+  })();
+
+  rl = readline.createInterface({
+    input: rlInput,
+    output: rlOutput,
+    terminal: Boolean(process.stdout.isTTY),
     historySize: 300,
     completer: (line: string) => completeLine(line, ctx)
   });
+  // Fullscreen compositor output routing.
+  (process.stdout as any).write = ((chunk: any, encoding?: any, cb?: any) => {
+    const text = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString(encoding || "utf8") : String(chunk);
+    appendOutput(text);
+    if (typeof cb === "function") cb();
+    return true;
+  }) as any;
+  console.log = (...args: any[]) => appendOutput(args.join(" ") + "\n");
+  console.error = (...args: any[]) => appendOutput(args.join(" ") + "\n");
   compositor.setReadline(rl);
   
   const pasteState: { mode: PasteMode } = { mode: "idle" };
@@ -117,8 +263,129 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   let lastSubmittedInput = "";
   let lastSubmittedAt = 0;
   let currentPlan: { explanation?: string; steps: UiPlanStep[] } | null = null;
+  let pendingPromptRedraw: NodeJS.Immediate | null = null;
+  let pendingGhostSuffix = "";
+
+  const schedulePromptRedraw = (ghost = "") => {
+    pendingGhostSuffix = ghost;
+    if (pendingPromptRedraw) return;
+    pendingPromptRedraw = setImmediate(() => {
+      pendingPromptRedraw = null;
+      if (!modalPromptActive) scheduleRender();
+    });
+  };
+
+  const renderScreen = () => {
+    if (!process.stdout.isTTY) return;
+    if (!fullscreenActive) return;
+    if (uiRenderInProgress) return;
+
+    uiRenderInProgress = true;
+    try {
+      const cols = process.stdout.columns || 96;
+      const rows = (process.stdout as any).rows || 32;
+
+      const input = buildInputPanel({
+        cols,
+        mode: promptMode(),
+        line: String(rl.line || ""),
+        cursor: Math.max(0, Math.min((rl as any).cursor ?? (rl.line || "").length, (rl.line || "").length)),
+        ctx,
+        ghostSuffix: pendingGhostSuffix,
+        thinking: aiThinking ? THINK_FRAMES[thinkingFrame] : "",
+        selectedIndex: suggestionSelected,
+      });
+      const inputH = input.lines.length;
+
+      const availableOutputH = Math.max(0, rows - inputH);
+      const tail: string[] = [];
+      const carry = outputCarry ? [outputCarry] : [];
+      const all = outputLines.concat(carry);
+      const maxScroll = Math.max(0, all.length - availableOutputH);
+      scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+      const start = Math.max(0, all.length - availableOutputH - scrollOffset);
+      for (const l of all.slice(start, start + availableOutputH)) {
+        tail.push(padAnsi(truncateAnsi(l, Math.max(0, cols - 1)), Math.max(0, cols - 1)));
+      }
+      while (tail.length < availableOutputH) tail.unshift("");
+
+      rawStdoutWrite("\x1b[H\x1b[2J");
+      for (const l of tail) rawStdoutWrite(l + "\n");
+      for (const l of input.lines) rawStdoutWrite(padAnsi(truncateAnsi(l, Math.max(0, cols - 1)), Math.max(0, cols - 1)) + "\n");
+      // Terminal cursor stays hidden; we render a visible cursor in the input line.
+    } finally {
+      uiRenderInProgress = false;
+    }
+  };
 
   const onMasterKeypress = async (str: string, key: { name?: string; ctrl?: boolean; shift?: boolean; sequence?: string }) => {
+    // While AI is responding, readline is paused. Keep input editable in fullscreen
+    // by applying keypresses directly to `rl.line` so typed text doesn't end up elsewhere.
+    if (fullscreenActive && aiThinking && !modalPromptActive) {
+      const current = String((rl as any).line || "");
+      const cur = Math.max(0, Math.min((rl as any).cursor ?? current.length, current.length));
+
+      if (key?.name === "left") {
+        (rl as any).cursor = Math.max(0, cur - 1);
+        scheduleRender();
+        return;
+      }
+      if (key?.name === "right") {
+        (rl as any).cursor = Math.min(current.length, cur + 1);
+        scheduleRender();
+        return;
+      }
+      if (key?.name === "backspace") {
+        if (cur > 0) {
+          (rl as any).line = current.slice(0, cur - 1) + current.slice(cur);
+          (rl as any).cursor = cur - 1;
+        }
+        scheduleRender();
+        return;
+      }
+      if (key?.ctrl && key?.name === "u") {
+        (rl as any).line = "";
+        (rl as any).cursor = 0;
+        scheduleRender();
+        return;
+      }
+      if (key?.name === "return" || key?.name === "enter") {
+        // Ignore submits while thinking; Esc/Ctrl+C stops the turn.
+        return;
+      }
+      if (typeof str === "string" && str.length === 1 && !key?.ctrl) {
+        (rl as any).line = current.slice(0, cur) + str + current.slice(cur);
+        (rl as any).cursor = cur + 1;
+        scheduleRender();
+        return;
+      }
+      // Fall through for other keys (Esc/Ctrl+C handled by compositor).
+    }
+
+    // Scroll output pane (PageUp/PageDown) in fullscreen mode.
+    if (!modalPromptActive && fullscreenActive && (key?.name === "pageup" || key?.name === "pagedown")) {
+      const cols = process.stdout.columns || 96;
+      const rows = (process.stdout as any).rows || 32;
+      const inputH = buildInputPanel({
+        cols,
+        mode: promptMode(),
+        line: String(rl.line || ""),
+        cursor: Math.max(0, Math.min((rl as any).cursor ?? (rl.line || "").length, (rl.line || "").length)),
+        ctx,
+        ghostSuffix: pendingGhostSuffix,
+        thinking: aiThinking ? THINK_FRAMES[thinkingFrame] : "",
+        selectedIndex: suggestionSelected,
+      }).lines.length;
+      const page = Math.max(1, rows - inputH - 1);
+      if (key.name === "pageup") {
+        scrollOffset = Math.min(outputLines.length, scrollOffset + page);
+      } else {
+        scrollOffset = Math.max(0, scrollOffset - page);
+      }
+      scheduleRender();
+      return;
+    }
+
     // 1. Image Paste (Ctrl+V)
     if (key?.ctrl && key?.name === "v") {
       if (!imagePasteBusy && process.stdin.isTTY) {
@@ -129,8 +396,8 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
             pendingImagePastes.push(pasted);
             const token = `[pasted image ${basename(pasted.path)}]`;
             pendingAttachments.push({ token, kind: "image", text: pasted.path, mime: pasted.mime, bytes: pasted.bytes });
-            insertPlaceholderToken(rl, token, promptPrefix());
-            if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
+            insertPlaceholderToken(rl, token, promptMode());
+            if (!modalPromptActive) scheduleRender();
           }
         } finally {
           imagePasteBusy = false;
@@ -147,7 +414,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       };
       await saveState(ctx.state);
       process.stdout.write(`\nmode=${ctx.state.executionMode} (toggled via Ctrl+Y)\n`);
-      if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
+      if (!modalPromptActive) scheduleRender();
       return;
     }
 
@@ -155,12 +422,12 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     if (key?.name === "tab" && key?.shift) {
       shellMode = !shellMode;
       process.stdout.write(`\ninput-mode=${shellMode ? "shell" : "chat"} (toggled via Shift+Tab)\n`);
-      if (!modalPromptActive) redrawPrompt(rl, promptPrefix());
+      if (!modalPromptActive) scheduleRender();
       return;
     }
 
-    // 4. PageUp -> Up
-    if (key?.name === "pageup") {
+    // 4. PageUp -> Up (non-fullscreen only)
+    if (!fullscreenActive && key?.name === "pageup") {
       rl.write(null, { name: "up" });
       return;
     }
@@ -168,37 +435,116 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     // 5. Esc/Ctrl+C Abort logic is now handled globally by the compositor in thinking mode.
     // Here we just handle redraws and ghost redraws.
 
-    // 6. Ghost Suggestions & Autocomplete
-    if (!modalPromptActive && key?.name !== "return" && key?.name !== "enter") {
-      const line = rl.line || "";
-      const trimmed = line.trimStart();
-      const suffix = trimmed.startsWith("/") ? ghostSuffix(line, trimmed, ctx) : "";
-
-      // Accept suggestion using Right Arrow or End key.
-      if (suffix && (key?.name === "right" || key?.name === "enter")) {
-        const cursor = (rl as any).cursor ?? line.length;
-        if (cursor >= line.length) {
-          rl.write(suffix);
-          return;
-        }
-      }
-
-      // Live redraw with ghost text
-      const prompt = promptPrefix();
-      const cursor = Math.max(0, Math.min((rl as any).cursor ?? line.length, line.length));
-      const moveLeft = (line.length - cursor) + (suffix ? suffix.length : 0);
-      process.stdout.write("\r\x1b[2K");
-      if (suffix) {
-        process.stdout.write(`${prompt}${line}\x1b[90m${suffix}\x1b[0m`);
-        if (moveLeft > 0) process.stdout.write(`\x1b[${moveLeft}D`);
-      } else {
-        process.stdout.write(`${prompt}${line}`);
-        if (moveLeft > 0) process.stdout.write(`\x1b[${moveLeft}D`);
-      }
+  // 6. Ghost Suggestions & Autocomplete
+  if (!modalPromptActive && key?.name !== "return" && key?.name !== "enter") {
+      // No inline/ghost suggestions; the selectable panel below the input handles suggestions.
+      schedulePromptRedraw("");
     }
   };
 
   compositor.on("keypress", onMasterKeypress);
+  compositor.on("data", (chunk: Buffer) => {
+    if (modalPromptActive) {
+      rlInput.write(chunk);
+      return;
+    }
+
+    // Forward non-mouse bytes to readline via a filtered stream.
+    // Strip both:
+    // - xterm SGR mouse: ESC [ < b ; x ; y M|m
+    // - legacy X10 mouse: ESC [ M b x y  (3 bytes)
+    const buf = mouseCarry ? Buffer.concat([mouseCarry, chunk]) : chunk;
+    const out: number[] = [];
+    let i = 0;
+
+    const emitWheel = (b: number) => {
+      if (!fullscreenActive) return;
+      if (b !== 64 && b !== 65) return;
+      const delta = 3;
+      if (b === 64) scrollOffset = Math.min(outputLines.length, scrollOffset + delta);
+      if (b === 65) scrollOffset = Math.max(0, scrollOffset - delta);
+      scheduleRender();
+    };
+
+    while (i < buf.length) {
+      const ch = buf[i];
+      if (ch === 0x1b && i + 2 < buf.length && buf[i + 1] === 0x5b) {
+        // SGR: ESC[<
+        if (buf[i + 2] === 0x3c) {
+          let j = i + 3;
+          while (j < buf.length && buf[j] !== 0x4d && buf[j] !== 0x6d) j++; // 'M' or 'm'
+          if (j >= buf.length) break; // incomplete
+
+          // Parse b (first number) for wheel detection.
+          let k = i + 3;
+          let bStr = "";
+          while (k < j && buf[k] >= 0x30 && buf[k] <= 0x39) {
+            bStr += String.fromCharCode(buf[k]);
+            k++;
+          }
+          if (bStr) emitWheel(Number(bStr));
+
+          i = j + 1; // skip entire sequence
+          continue;
+        }
+        // X10: ESC[M + 3 bytes
+        if (buf[i + 2] === 0x4d) {
+          if (i + 5 >= buf.length) break; // incomplete
+          i += 6;
+          continue;
+        }
+      }
+
+      // Non-mouse byte: forward.
+      out.push(ch);
+      i++;
+    }
+
+    mouseCarry = i < buf.length ? buf.subarray(i) : null;
+    if (out.length) rlInput.write(Buffer.from(out));
+  });
+
+  compositor.on("keypress", (_str: string, key: any) => {
+    if (!fullscreenActive || modalPromptActive) return;
+    const line = String(rl.line || "");
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith("/")) return;
+    const [items] = completeLine(trimmed, ctx);
+    if (items.length) {
+      suggestionSelected = Math.max(0, Math.min(suggestionSelected, items.length - 1));
+    } else {
+      suggestionSelected = 0;
+    }
+    if (key?.name === "up") {
+      suggestionSelected = Math.max(0, suggestionSelected - 1);
+      scheduleRender();
+      return;
+    }
+    if (key?.name === "down") {
+      suggestionSelected = Math.min(suggestionSelected + 1, Math.max(0, items.length - 1));
+      scheduleRender();
+      return;
+    }
+    if (key?.name === "tab" || key?.name === "right") {
+      if (!items.length) return;
+      const pickRaw = items[Math.max(0, Math.min(suggestionSelected, items.length - 1))];
+      const pick = String(pickRaw || "");
+      // Replace current input with selected completion (preserve leading spaces if any).
+      const leading = line.slice(0, line.length - trimmed.length);
+      if (/\s/.test(trimmed)) {
+        // Completing an argument (e.g. "/provider <name>"): replace the last token.
+        const nextTrimmed = trimmed.replace(/\S*$/, pick);
+        (rl as any).line = `${leading}${nextTrimmed}`;
+      } else {
+        // Completing a command: ensure a single leading slash.
+        const name = pick.startsWith("/") ? pick.slice(1) : pick;
+        (rl as any).line = `${leading}/${name}`;
+      }
+      (rl as any).cursor = ((rl as any).line as string).length;
+      scheduleRender();
+      return;
+    }
+  });
 
   const stopPasteIndicator = enablePasteIndicator(({ phase, chars, text, multiline, echoedRows, lineCount }) => {
     if (phase === "receiving_paste") {
@@ -210,16 +556,8 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       return;
     }
 
-    if (!multiline) {
-      pasteState.mode = "idle";
-      return;
-    }
-
-    const token = `[pasted ${chars} chars]`;
-    pendingAttachments.push({ token, kind: "text", text });
-    insertPlaceholderToken(rl, token, promptPrefix());
+    // Allow normal paste behavior; don't inject placeholder tokens.
     pasteState.mode = "idle";
-    suppressQueuedPasteLines = Math.max(0, (lineCount ?? 0) + 1);
   });
 
   let autosaveInFlight: Promise<void> | null = null;
@@ -243,27 +581,31 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   }, 4000);
 
   const updateInfo = await checkForNpmUpdate();
-  renderHeader(ctx.state);
+  const logoAscii = FORGE_LOGO_SOURCE;
+  enterFullscreen();
+  // Render the banner into scrollback so output naturally "pushes" it away.
+  for (const l of buildHeaderPanel(ctx.state, process.stdout.columns || 96, logoAscii)) outputLines.push(stripAnsi(l));
+  outputLines.push("");
+  scheduleRender();
+  const onResize = () => scheduleRender();
+  process.on("SIGWINCH", onResize);
   if (updateInfo) renderUpdateBanner(updateInfo.current, updateInfo.latest, updateInfo.name);
   const effectiveMcpServers = getEffectiveMcpServers(ctx.state);
   if (effectiveMcpServers.length) {
     console.log(`${C.gray}mcp> loading ${effectiveMcpServers.length} servers in background...${C.reset}`);
     void prewarmMcpServers(ctx.state, ({ completed, total, server, tools, ok, message }) => {
       const status = ok ? `${tools} tools` : `failed`;
-      process.stdout.write(`\r\x1b[2K${C.gray}mcp> ${completed}/${total} ${server} ${status}${C.reset}\n`);
-      redrawPrompt(rl, promptPrefix());
+      process.stdout.write(`${C.gray}mcp> ${completed}/${total} ${server} ${status}${C.reset}\n`);
     }).then((tools) => {
       const serverCount = effectiveMcpServers.length;
-      process.stdout.write(`\r\x1b[2K${C.gray}mcp ready: ${serverCount} servers, ${tools.length} tools${C.reset}\n`);
+      process.stdout.write(`${C.gray}mcp ready: ${serverCount} servers, ${tools.length} tools${C.reset}\n`);
       for (const diagnostic of getMcpDiagnostics(ctx.state)) {
         if (!diagnostic.ok || diagnostic.tools === 0) {
-          process.stdout.write(`\r\x1b[2K${C.gray}mcp! ${diagnostic.server}: ${diagnostic.message}${C.reset}\n`);
+          process.stdout.write(`${C.gray}mcp! ${diagnostic.server}: ${diagnostic.message}${C.reset}\n`);
         }
       }
-      redrawPrompt(rl, promptPrefix());
     }).catch(() => {
-      process.stdout.write(`\r\x1b[2K${C.gray}mcp warmup skipped${C.reset}\n`);
-      redrawPrompt(rl, promptPrefix());
+      process.stdout.write(`${C.gray}mcp warmup skipped${C.reset}\n`);
     });
   }
   if (resumed) {
@@ -286,19 +628,20 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
 
   while (true) {
     if (suppressQueuedPasteLines > 0) {
-      await question(rl, "");
+      await question(rl, "", { mute: true });
       suppressQueuedPasteLines--;
       if (suppressQueuedPasteLines === 0) {
         if (pendingTextPasteToken) {
-          insertPlaceholderToken(rl, pendingTextPasteToken, promptPrefix());
+          insertPlaceholderToken(rl, pendingTextPasteToken, promptMode());
           pendingTextPasteToken = null;
         }
       }
-      redrawPrompt(rl, promptPrefix());
+      scheduleRender();
       continue;
     }
 
-    const source = await question(rl, promptPrefix());
+    scheduleRender();
+    const source = await question(rl, "", { mute: true });
     (rl as any).line = "";
     (rl as any).cursor = 0;
     pendingAttachments = pendingAttachments.filter((att) => source.includes(att.token));
@@ -322,8 +665,12 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
 
   async function processInput(input: string): Promise<boolean> {
     if (input.startsWith("/")) {
-      const shouldExit = await handleSlash(input, ctx, rl);
-      return shouldExit;
+      try {
+        const shouldExit = await handleSlash(input, ctx, rl);
+        return shouldExit;
+      } finally {
+        scheduleRender();
+      }
     }
 
     if (shellMode) {
@@ -333,6 +680,8 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
         process.stdout.write(`exit=${r.code}\n`);
       } catch (err) {
         console.error(`error> ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        scheduleRender();
       }
       return false;
     }
@@ -375,13 +724,17 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
           activeTurnAbort.abort();
           if (activeSpinner) activeSpinner.stop();
           process.stdout.write("\n[stopping ai response...]\n");
+          if (fullscreenActive) setThinking(false);
         }
       });
+      if (fullscreenActive) setThinking(true);
 
       const spinner = createSpinner("thinking...");
       activeSpinner = spinner;
-      process.stdout.write("\r\x1b[2K");
-      spinner.start();
+      if (!fullscreenActive) {
+        process.stdout.write("\r\x1b[2K");
+        spinner.start();
+      }
       const toolDivider = `${C.dim}${"-".repeat(72)}${C.reset}\n`;
       try {
         const skillsContext = await loadSkillsContext(ctx.state.projectRoot);
@@ -472,6 +825,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       } finally {
         spinner.stop();
         activeSpinner = null;
+        if (fullscreenActive) setThinking(false);
         compositor.exitThinking();
       }
     } catch (err) {
@@ -484,17 +838,51 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   }
 
   if (process.stdout.isTTY) {
-    process.stdout.write("\r\x1b[2K");
+    // Final render cleanup.
+    exitFullscreen();
+  }
+  if (thinkingTimer) {
+    clearInterval(thinkingTimer);
+    thinkingTimer = null;
   }
   rl.close();
+  rlInput.end();
+  process.off("SIGWINCH", onResize);
+  // Restore global writers.
+  (process.stdout as any).write = rawStdoutWrite as any;
+  console.log = rawConsoleLog;
+  console.error = rawConsoleError;
   compositor.reset();
   stopPasteIndicator();
   clearInterval(autosaveTimer);
+  // Ensure terminal returns to a sane state even if something went sideways.
+  if (process.stdin.isTTY) {
+    try {
+      process.stdin.setRawMode(false);
+    } catch {
+      // ignore
+    }
+    try {
+      process.stdin.pause();
+    } catch {
+      // ignore
+    }
+  }
   console.log(`to resume this chat use: forge resume ${ctx.chat.name}`);
 }
 
-function question(rl: readline.Interface, prompt: string): Promise<string> {
-  return new Promise((resolve) => rl.question(prompt, resolve));
+function question(rl: readline.Interface, prompt: string, opts?: { mute?: boolean }): Promise<string> {
+  const output = (rl as any).output as { muted?: boolean } | undefined;
+  const prevMuted = output?.muted;
+  if (output && typeof output.muted === "boolean") {
+    output.muted = Boolean(opts?.mute);
+  }
+  return new Promise((resolve) => rl.question(prompt, (ans) => {
+    if (output && typeof output.muted === "boolean" && typeof prevMuted === "boolean") {
+      output.muted = prevMuted;
+    }
+    resolve(ans);
+  }));
 }
 
 function createSpinner(initialLabel: string): {
@@ -1326,9 +1714,148 @@ function enablePasteIndicator(
   };
 }
 
-function redrawPrompt(rl: readline.Interface, prompt = "you> "): void {
-  if ((rl as any).__forgeModalPromptActive) return;
-  process.stdout.write(`\r\x1b[2K${prompt}${rl.line}`);
+function buildHeaderPanel(state: ForgeState, cols: number, logoLines?: string[] | null): string[] {
+  const width = Math.max(60, Math.min(cols - 2, 120));
+  const inner = width - 2;
+  const leftW = Math.floor(inner * 0.46);
+  const rightW = inner - leftW - 1;
+
+  const logo = (logoLines && logoLines.length)
+    ? logoLines
+    : [
+      "      ██╗███╗   ██╗",
+      "      ██║████╗  ██║",
+      "      ██║██╔██╗ ██║",
+      "      ██║██║╚██╗██║",
+      "      ██║██║ ╚████║",
+      "      ╚═╝╚═╝  ╚═══╝"
+    ];
+
+  const leftLines = [
+    `${C.white}Welcome back!${C.reset}`,
+    "",
+    ...logo.map((l) => `${C.green}${l}${C.reset}`),
+    "",
+    `${C.gray}${state.provider.provider} • ${state.provider.model}${C.reset}`,
+    `${C.gray}${state.projectRoot}${C.reset}`
+  ];
+
+  const rightLines = [
+    `${C.white}Tips for getting started${C.reset}`,
+    `${C.gray}Ask Forge to create a new app or clone a repository${C.reset}`,
+    "",
+    `${C.white}Recent activity${C.reset}`,
+    `${C.gray}No recent activity${C.reset}`,
+    "",
+    `${C.gray}Type /help for commands • Shift+Tab toggles shell${C.reset}`
+  ];
+
+  const height = Math.max(leftLines.length, rightLines.length);
+  const out: string[] = [];
+  out.push(`${C.yellow}┌${"─".repeat(leftW)}┬${"─".repeat(rightW)}┐${C.reset}`);
+  for (let i = 0; i < height; i++) {
+    const l = leftLines[i] || "";
+    const r = rightLines[i] || "";
+    out.push(`${C.yellow}│${C.reset}${padAnsi(truncateAnsi(l, leftW), leftW)}${C.yellow}│${C.reset}${padAnsi(truncateAnsi(r, rightW), rightW)}${C.yellow}│${C.reset}`);
+  }
+  out.push(`${C.yellow}└${"─".repeat(leftW)}┴${"─".repeat(rightW)}┘${C.reset}`);
+  const safeCols = Math.max(0, cols - 1);
+  return out.map((l) => padAnsi(truncateAnsi(l, safeCols), safeCols));
+}
+
+function buildInputPanel(args: {
+  cols: number;
+  mode: "chat" | "shell";
+  line: string;
+  cursor: number;
+  ghostSuffix: string;
+  ctx: ChatContext;
+  thinking: string;
+  selectedIndex: number;
+}): { lines: string[] } {
+  const cols = args.cols;
+  const safeCols = Math.max(20, cols - 1); // never touch last col
+  const innerWidth = Math.max(44, Math.min(120, safeCols - 4));
+  const label = args.mode === "shell" ? " shell " : " chat ";
+  const top = `${C.gray}┌─${C.reset}${C.white}${label}${C.reset}${C.gray}${"─".repeat(Math.max(0, innerWidth - (label.length + 2)))}┐${C.reset}`;
+  const bottom = `${C.gray}└${"─".repeat(innerWidth)}┘${C.reset}`;
+
+  const yolo = (args.ctx.state.executionMode === "yolo");
+  const prefixPlain = `${yolo ? "*" : "›"} `;
+  const prefixStyled = yolo ? `\x1b[31m*\x1b[0m ` : prefixPlain;
+  const maxTextWidth = Math.max(1, innerWidth - 4);
+  const cursor = Math.max(0, Math.min(args.cursor, args.line.length));
+  const showGhost = Boolean(args.ghostSuffix) && cursor >= args.line.length;
+  const displayText = showGhost ? `${args.line}${args.ghostSuffix}` : args.line;
+  const viewStart = Math.max(0, cursor - maxTextWidth + 1);
+  const viewText = displayText.slice(viewStart, viewStart + maxTextWidth);
+  const typedVisible = args.line.slice(viewStart, viewStart + maxTextWidth);
+  const typedLenInView = Math.max(0, Math.min(cursor - viewStart, typedVisible.length));
+
+  const contentWidth = Math.max(0, (innerWidth - 2) - prefixPlain.length);
+  const contentPlain = viewText.padEnd(contentWidth, " ");
+  const contentCursor = Math.max(0, Math.min(contentPlain.length, typedLenInView));
+  const before = contentPlain.slice(0, contentCursor);
+  const after = contentPlain.slice(contentCursor + 1);
+  const cursorCell = `\x1b[7m${contentPlain[contentCursor] || " "}\x1b[0m`;
+  const mid = `${C.gray}│${C.reset} ${prefixStyled}${before}${cursorCell}${after}${C.gray}│${C.reset}`;
+
+  const trimmed = args.line.trimStart();
+  const showShortcuts = trimmed === "?" || trimmed === "? ";
+  const helpLine = args.thinking
+    ? `${C.yellow}${args.thinking}${C.reset} ${C.gray}ai is responding… (Esc/Ctrl+C to stop)${C.reset}`
+    : `${C.dim}?${C.reset} ${C.gray}for shortcuts${C.reset}`;
+  const statusAbove = args.thinking ? helpLine : "";
+
+  const suggestionLines: string[] = [];
+  if (showShortcuts) {
+    const shortcuts = [
+      [`Shift+Tab`, `toggle input mode (chat ↔ shell)`],
+      [`Ctrl+Y`, `toggle yolo mode`],
+      [`Ctrl+V`, `paste clipboard image as attachment`],
+      [`PageUp/PageDown`, `scroll output`],
+      [`Mouse Wheel`, `scroll output`],
+      [`Esc/Ctrl+C`, `stop AI while responding`],
+    ];
+    const keyW = Math.min(18, Math.max(12, Math.floor(safeCols * 0.28)));
+    const descW = Math.max(0, safeCols - keyW - 4);
+    for (const [k, d] of shortcuts) {
+      const left = padAnsi(truncateAnsi(k, keyW), keyW);
+      const right = truncateAnsi(d, descW);
+      suggestionLines.push(padAnsi(truncateAnsi(`${C.cyan}${left}${C.reset}  ${C.gray}${right}${C.reset}`, safeCols), safeCols));
+    }
+  } else if (trimmed.startsWith("/")) {
+    const [suggestions] = completeLine(trimmed, args.ctx);
+    const items = suggestions.slice(0, 8);
+    const selected = Math.max(0, Math.min(args.selectedIndex, Math.max(0, items.length - 1)));
+    const cmdW = Math.min(18, Math.max(10, Math.floor(safeCols * 0.25)));
+    const descW = Math.max(0, safeCols - cmdW - 4);
+    const isArgCompletion = /\s/.test(trimmed);
+    for (let i = 0; i < items.length; i++) {
+      const raw = String(items[i] || "");
+      const name = raw.startsWith("/") ? raw.slice(1) : raw;
+      const leftText = isArgCompletion ? name : `/${name}`;
+      const desc = isArgCompletion ? "" : (COMMAND_DESCRIPTIONS[`/${name}`] || "");
+      const left = padAnsi(truncateAnsi(leftText, cmdW), cmdW);
+      const right = truncateAnsi(desc, descW);
+      const row = `${left}  ${C.gray}${right}${C.reset}`;
+      if (i === selected) {
+        suggestionLines.push(padAnsi(truncateAnsi(`\x1b[7m${row}\x1b[0m`, safeCols), safeCols));
+      } else {
+        suggestionLines.push(padAnsi(truncateAnsi(row, safeCols), safeCols));
+      }
+    }
+  }
+
+  const lines = [
+    padAnsi(truncateAnsi(statusAbove, safeCols), safeCols),
+    padAnsi(truncateAnsi(top, safeCols), safeCols),
+    padAnsi(truncateAnsi(mid, safeCols), safeCols),
+    padAnsi(truncateAnsi(bottom, safeCols), safeCols),
+    padAnsi(truncateAnsi(args.thinking ? "" : helpLine, safeCols), safeCols),
+    ...suggestionLines,
+  ];
+  return { lines };
 }
 
 function clearRecentlyEchoedRows(rows: number): void {
@@ -1340,12 +1867,12 @@ function clearRecentlyEchoedRows(rows: number): void {
   process.stdout.write("\r\x1b[2K");
 }
 
-function insertPlaceholderToken(rl: readline.Interface, token: string, prompt: string): void {
+function insertPlaceholderToken(rl: readline.Interface, token: string, mode: string): void {
   const current = String(rl.line || "");
   const next = current.trim().length ? `${current} ${token}` : token;
   rl.write(null, { ctrl: true, name: "u" });
   rl.write(next);
-  redrawPrompt(rl, prompt);
+  // Caller handles redraw with ctx for suggestions.
 }
 
 function ghostSuffix(line: string, trimmed: string, ctx: ChatContext): string {
@@ -1368,16 +1895,283 @@ function ghostSuffix(line: string, trimmed: string, ctx: ChatContext): string {
 }
 
 function renderHeader(state: ForgeState): void {
-  const width = 96;
-  const lines = [
-    `provider=${state.provider.provider} model=${state.provider.model} mode=${state.executionMode || "safe"} searchmode=${state.searchMode || "safe"}`,
-    `root=${state.projectRoot}`,
-    "Type /help for commands. Press Right/End for ghost autocomplete.",
-    `Discord: ${C.blue}${C.underline}https://discord.gg/QrfpWDuZqd${C.reset}`,
-    `Instagram: ${C.blue}${C.underline}https://www.instagram.com/cognautic/${C.reset}`
+  const cols = process.stdout.columns || 110;
+  const width = Math.max(86, Math.min(cols - 2, 120));
+  const inner = width - 2;
+  const leftW = Math.floor(inner * 0.46);
+  const rightW = inner - leftW - 1;
+
+  const logo = [
+    "      ██╗███╗   ██╗",
+    "      ██║████╗  ██║",
+    "      ██║██╔██╗ ██║",
+    "      ██║██║╚██╗██║",
+    "      ██║██║ ╚████║",
+    "      ╚═╝╚═╝  ╚═══╝"
   ];
-  for (const line of lines) console.log(line);
-  console.log(`${C.gray}${"─".repeat(width)}${C.reset}`);
+
+  const leftLines = [
+    `${C.white}Welcome back!${C.reset}`,
+    "",
+    ...logo.map((l) => `${C.yellow}${l}${C.reset}`),
+    "",
+    `${C.gray}${state.provider.provider} • ${state.provider.model}${C.reset}`,
+    `${C.gray}${state.projectRoot}${C.reset}`
+  ];
+
+  const rightLines = [
+    `${C.white}Tips for getting started${C.reset}`,
+    `${C.gray}Ask Forge to create a new app or clone a repository${C.reset}`,
+    "",
+    `${C.white}Recent activity${C.reset}`,
+    `${C.gray}No recent activity${C.reset}`,
+    "",
+    `${C.gray}Type /help for commands • Right/End accepts ghost${C.reset}`
+  ];
+
+  const height = Math.max(leftLines.length, rightLines.length);
+  console.log(`${C.yellow}┌${"─".repeat(leftW)}┬${"─".repeat(rightW)}┐${C.reset}`);
+  for (let i = 0; i < height; i++) {
+    const l = leftLines[i] || "";
+    const r = rightLines[i] || "";
+    console.log(
+      `${C.yellow}│${C.reset}${padAnsi(truncateAnsi(l, leftW), leftW)}${C.yellow}│${C.reset}${padAnsi(truncateAnsi(r, rightW), rightW)}${C.yellow}│${C.reset}`
+    );
+  }
+  console.log(`${C.yellow}└${"─".repeat(leftW)}┴${"─".repeat(rightW)}┘${C.reset}`);
+  console.log("");
+}
+
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function truncateAnsi(s: string, width: number): string {
+  const plain = stripAnsi(s);
+  if (plain.length <= width) return s;
+  // Best-effort: truncate plain text, keep it unstyled to avoid broken escape sequences.
+  return plain.slice(0, width);
+}
+
+function padAnsi(s: string, width: number): string {
+  const len = stripAnsi(s).length;
+  if (len >= width) return s;
+  return s + " ".repeat(width - len);
+}
+
+async function tryRenderForgeSvgAscii(targetW: number, targetH: number): Promise<string[] | null> {
+  try {
+    const candidates = [
+      join(__dirname, "../../../../assets/Forge.svg"),
+      join(__dirname, "../../../../src/assets/Forge.svg"),
+      join(process.cwd(), "assets/Forge.svg"),
+      join(process.cwd(), "src/assets/Forge.svg"),
+    ];
+    let svg: string | null = null;
+    for (const p of candidates) {
+      try {
+        svg = await readFile(p, "utf8");
+        break;
+      } catch {
+        // try next
+      }
+    }
+    if (!svg) return null;
+    const raster = await svgToAsciiViaPlaywright(svg, targetW, targetH).catch(() => null);
+    return raster && raster.length ? raster : svgRectsToAscii(svg, targetW, targetH);
+  } catch {
+    return null;
+  }
+}
+
+async function svgToAsciiViaPlaywright(svg: string, w: number, h: number): Promise<string[]> {
+  const mod = await import("playwright");
+  const chromium = (mod as any).chromium;
+  if (!chromium) return [];
+
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const html = `<!doctype html>
+<html>
+<head><meta charset="utf-8"/></head>
+<body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100vh;">
+  <div id="wrap" style="width:512px;height:512px;display:flex;align-items:center;justify-content:center;">
+    ${svg.replace(/fill="white"/gi, 'fill="#ffffff"')}
+  </div>
+</body>
+</html>`;
+    await page.setContent(html, { waitUntil: "domcontentloaded" });
+
+    const pixels = await (page as any).evaluate(async ({ outW, outH }: any) => {
+      const document: any = (globalThis as any).document;
+      const XMLSerializer: any = (globalThis as any).XMLSerializer;
+      const Image: any = (globalThis as any).Image;
+      const Blob: any = (globalThis as any).Blob;
+      const URL: any = (globalThis as any).URL;
+
+      const svgEl = document?.querySelector?.("svg");
+      if (!svgEl) return null;
+      // Serialize SVG into an image.
+      const serializer = new XMLSerializer();
+      const svgText = serializer.serializeToString(svgEl);
+      const blob = new Blob([svgText], { type: "image/svg+xml" });
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      URL.revokeObjectURL(url);
+
+      const cellW = 8;
+      const cellH = 16;
+      const cw = outW * cellW;
+      const ch = outH * cellH;
+      const canvas = document.createElement("canvas");
+      canvas.width = cw;
+      canvas.height = ch;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.clearRect(0, 0, cw, ch);
+      ctx.drawImage(img, 0, 0, cw, ch);
+      const data = ctx.getImageData(0, 0, cw, ch).data;
+
+      const out: number[][] = Array.from({ length: outH }, () => Array(outW).fill(0));
+      for (let y = 0; y < outH; y++) {
+        for (let x = 0; x < outW; x++) {
+          let sum = 0;
+          let n = 0;
+          for (let yy = 0; yy < cellH; yy++) {
+            for (let xx = 0; xx < cellW; xx++) {
+              const px = x * cellW + xx;
+              const py = y * cellH + yy;
+              const idx = (py * cw + px) * 4;
+              const r = data[idx];
+              const g = data[idx + 1];
+              const b = data[idx + 2];
+              const a = data[idx + 3];
+              if (a < 10) continue;
+              // Luma
+              sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+              n++;
+            }
+          }
+          out[y][x] = n ? sum / (n * 255) : 0;
+        }
+      }
+      return out;
+    }, { outW: w, outH: h });
+
+    if (!pixels) return [];
+    const on = "█";
+    const off = " ";
+    return pixels.map((row: number[]) => row.map((v) => (v > 0.15 ? on : off)).join("").replace(/\s+$/g, ""));
+  } finally {
+    await browser.close();
+  }
+}
+
+function svgRectsToAscii(svg: string, w: number, h: number): string[] {
+  const vb = svg.match(/viewBox="([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)"/i);
+  if (!vb) return [];
+  const vbX = Number(vb[1] || 0);
+  const vbY = Number(vb[2] || 0);
+  const vbW = Number(vb[3] || 1);
+  const vbH = Number(vb[4] || 1);
+
+  const rectRe = /<rect\s+([^>]+?)\s*\/?>/gi;
+  const rects: Array<{ x: number; y: number; w: number; h: number; rot?: { deg: number; cx: number; cy: number } }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = rectRe.exec(svg))) {
+    const attrs = m[1] || "";
+    const get = (name: string) => {
+      const mm = attrs.match(new RegExp(`${name}=\"([0-9.]+)\"`, "i"));
+      return mm ? Number(mm[1]) : NaN;
+    };
+    const x = get("x");
+    const y = get("y");
+    const rw = get("width");
+    const rh = get("height");
+    if (!Number.isFinite(rw) || !Number.isFinite(rh)) continue;
+    const transform = attrs.match(/transform=\"rotate\\(([-0-9.]+)\\s+([0-9.]+)\\s+([0-9.]+)\\)\"/i);
+    const rot = transform
+      ? { deg: Number(transform[1] || 0), cx: Number(transform[2] || 0), cy: Number(transform[3] || 0) }
+      : undefined;
+    rects.push({ x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0, w: rw, h: rh, rot });
+  }
+
+  const grid: boolean[][] = Array.from({ length: h }, () => Array.from({ length: w }, () => false));
+
+  const invRotate = (px: number, py: number, rot?: { deg: number; cx: number; cy: number }) => {
+    if (!rot) return { x: px, y: py };
+    const rad = (-rot.deg * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const tx = px - rot.cx;
+    const ty = py - rot.cy;
+    const nx = tx * cos - ty * sin;
+    const ny = tx * sin + ty * cos;
+    return { x: nx + rot.cx, y: ny + rot.cy };
+  };
+
+  // Sample cell centers in viewBox space and test membership in each rect.
+  for (let gy = 0; gy < h; gy++) {
+    for (let gx = 0; gx < w; gx++) {
+      const u = (gx + 0.5) / w;
+      const v = (gy + 0.5) / h;
+      const px = vbX + u * vbW;
+      const py = vbY + v * vbH;
+      let on = false;
+      for (const r of rects) {
+        const p = invRotate(px, py, r.rot);
+        if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) {
+          on = true;
+          break;
+        }
+      }
+      grid[gy][gx] = on;
+    }
+  }
+
+  const on = "█";
+  const off = " ";
+  return grid.map((row) => row.map((v) => (v ? on : off)).join("").replace(/\s+$/g, ""));
+}
+
+function renderSquareLogo(lines: string[], outW: number, outH: number): string[] {
+  const srcH = lines.length;
+  const srcW = Math.max(0, ...lines.map((l) => stripAnsi(l).length));
+  if (!srcW || !srcH || outW <= 0 || outH <= 0) return [];
+
+  const src: boolean[][] = Array.from({ length: srcH }, (_, y) => {
+    const row = stripAnsi(lines[y] || "").padEnd(srcW, " ");
+    return Array.from(row, (ch) => ch !== " " && ch !== "\t");
+  });
+
+  const dst: string[] = [];
+  for (let y = 0; y < outH; y++) {
+    let row = "";
+    const y0 = Math.floor((y * srcH) / outH);
+    const y1 = Math.max(y0 + 1, Math.floor(((y + 1) * srcH) / outH));
+    for (let x = 0; x < outW; x++) {
+      const x0 = Math.floor((x * srcW) / outW);
+      const x1 = Math.max(x0 + 1, Math.floor(((x + 1) * srcW) / outW));
+      let on = 0;
+      let total = 0;
+      for (let yy = y0; yy < y1; yy++) {
+        for (let xx = x0; xx < x1; xx++) {
+          total++;
+          if (src[yy]?.[xx]) on++;
+        }
+      }
+      row += on / Math.max(1, total) > 0.35 ? "█" : " ";
+    }
+    dst.push(row.replace(/\s+$/g, ""));
+  }
+
+  // Trim empty rows.
+  while (dst.length && !dst[0].trim()) dst.shift();
+  while (dst.length && !dst[dst.length - 1].trim()) dst.pop();
+  return dst;
 }
 
 function printStatus(state: ForgeState, modelCount: number): void {
