@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.0.17 - 2026-04-06
+- Fixed fullscreen chat input and stop/confirm behavior:
+  - stopping an AI turn now restores the chat composer cleanly instead of leaving input dead or echoing into the transcript area
+  - safe-mode confirmation and `user.wait` prompts now render correctly inside the fullscreen UI
+  - modal `y/n` input is isolated from the main chat draft, so confirm replies no longer appear in the normal prompt box
+  - non-mouse CSI keyboard input like arrows, history, delete, home, and end now flows correctly to `readline` again
+- Fixed fullscreen transcript rendering:
+  - long AI/tool output now wraps in the output pane instead of being visually cut off
+  - scrolling/page calculations now use wrapped visual lines
+- Fixed agent planning flow:
+  - repeated `plans.update` calls no longer stall turns in plan-only loops without executing the next step
+- Fixed Google auth session persistence:
+  - OAuth clients are cached across tool calls
+  - refreshed Google tokens are persisted immediately
+  - stale cached auth is cleared on re-login/logout
+  - duplicate token listeners are removed before reattaching
+
 ## 0.0.16 - 2026-04-05
 - Replaced the old config prompt flow with a Forge-native interactive config screen inside the fullscreen chat UI:
   - arrow-key selectable rows for provider, model, API key, endpoint, browser path, search mode, project root, and execution mode
