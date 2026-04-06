@@ -59,6 +59,25 @@ type PendingAttachment = { token: string; kind: "text" | "image"; text: string; 
 type PlanStatus = "pending" | "in_progress" | "completed";
 type UiPlanStep = { step: string; status: PlanStatus };
 type PackageMeta = { name: string; version: string };
+type ConfigFieldKey =
+  | "provider"
+  | "apikey"
+  | "model"
+  | "endpoint"
+  | "browserpath"
+  | "searchmode"
+  | "projectroot"
+  | "execmode";
+type ConfigActionKey = ConfigFieldKey | "save" | "cancel";
+type ConfigScreenState = {
+  working: ForgeState;
+  selectedIndex: number;
+  mode: "nav" | "edit";
+  editingField?: ConfigFieldKey;
+  editBuffer: string;
+  resolver: () => void;
+  notice: string;
+};
 
 const COMMANDS = [
   "/help",
@@ -212,6 +231,50 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     scheduleRender();
   };
 
+  const resetChatInputState = () => {
+    mouseCarry = null;
+    pendingGhostSuffix = "";
+    suggestionSelected = 0;
+    (rl as any).__forgeExternalPromptActive = false;
+    (rl as any).line = "";
+    (rl as any).cursor = 0;
+    try {
+      rl.resume();
+    } catch {
+      // ignore
+    }
+    if (process.stdin.isTTY) {
+      try {
+        process.stdin.setRawMode(true);
+      } catch {
+        // ignore terminal restoration failures
+      }
+      if (process.stdin.isPaused()) process.stdin.resume();
+    }
+  };
+
+  const runConfigSession = async () => {
+    configWizardActive = true;
+    try {
+      await new Promise<void>((resolve) => {
+        configScreen = {
+          working: { ...ctx.state, provider: { ...ctx.state.provider }, apiKeys: { ...ctx.state.apiKeys } },
+          selectedIndex: 0,
+          mode: "nav",
+          editBuffer: "",
+          resolver: resolve,
+          notice: "Arrows move. Enter edits/selects. Esc cancels."
+        };
+        scheduleRender();
+      });
+    } finally {
+      configWizardActive = false;
+      configScreen = null;
+      resetChatInputState();
+      scheduleRender();
+    }
+  };
+
   const enterFullscreen = () => {
     if (!process.stdout.isTTY || fullscreenActive) return;
     fullscreenActive = true;
@@ -245,12 +308,28 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   // Fullscreen compositor output routing.
   (process.stdout as any).write = ((chunk: any, encoding?: any, cb?: any) => {
     const text = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString(encoding || "utf8") : String(chunk);
+    if ((rl as any)?.__forgeExternalPromptActive) {
+      rawStdoutWrite(chunk, encoding, cb);
+      return true;
+    }
     appendOutput(text);
     if (typeof cb === "function") cb();
     return true;
   }) as any;
-  console.log = (...args: any[]) => appendOutput(args.join(" ") + "\n");
-  console.error = (...args: any[]) => appendOutput(args.join(" ") + "\n");
+  console.log = (...args: any[]) => {
+    if ((rl as any)?.__forgeExternalPromptActive) {
+      rawConsoleLog(...args);
+      return;
+    }
+    appendOutput(args.join(" ") + "\n");
+  };
+  console.error = (...args: any[]) => {
+    if ((rl as any)?.__forgeExternalPromptActive) {
+      rawConsoleError(...args);
+      return;
+    }
+    appendOutput(args.join(" ") + "\n");
+  };
   compositor.setReadline(rl);
   
   const pasteState: { mode: PasteMode } = { mode: "idle" };
@@ -260,11 +339,18 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   let pendingImagePastes: Array<{ path: string; mime: string; bytes: number }> = [];
   let imagePasteBusy = false;
   let modalPromptActive = false;
+  let configWizardActive = false;
+  let configScreen: ConfigScreenState | null = null;
+  let launchingInlineConfig = false;
   let lastSubmittedInput = "";
   let lastSubmittedAt = 0;
   let currentPlan: { explanation?: string; steps: UiPlanStep[] } | null = null;
   let pendingPromptRedraw: NodeJS.Immediate | null = null;
   let pendingGhostSuffix = "";
+  let modalPromptLabel = "";
+  let modalPromptBuffer = "";
+  let preservedInputLine = "";
+  let preservedInputCursor = 0;
 
   const schedulePromptRedraw = (ghost = "") => {
     pendingGhostSuffix = ghost;
@@ -285,31 +371,47 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       const cols = process.stdout.columns || 96;
       const rows = (process.stdout as any).rows || 32;
 
-      const input = buildInputPanel({
-        cols,
-        mode: promptMode(),
-        line: String(rl.line || ""),
-        cursor: Math.max(0, Math.min((rl as any).cursor ?? (rl.line || "").length, (rl.line || "").length)),
-        ctx,
-        ghostSuffix: pendingGhostSuffix,
-        thinking: aiThinking ? THINK_FRAMES[thinkingFrame] : "",
-        selectedIndex: suggestionSelected,
-      });
+      if (configScreen) {
+        const lines = buildConfigPanel(cols, rows, configScreen);
+        rawStdoutWrite("\x1b[?25l\x1b[H\x1b[2J");
+        for (const line of lines) {
+          rawStdoutWrite(padAnsi(truncateAnsi(line, Math.max(0, cols - 1)), Math.max(0, cols - 1)) + "\n");
+        }
+        return;
+      }
+
+      const input = configWizardActive
+        ? { lines: [] }
+        : buildInputPanel({
+            cols,
+            mode: modalPromptActive && fullscreenActive ? "modal" : promptMode(),
+            line: modalPromptActive && fullscreenActive ? modalPromptBuffer : String(rl.line || ""),
+            cursor: modalPromptActive && fullscreenActive
+              ? modalPromptBuffer.length
+              : Math.max(0, Math.min((rl as any).cursor ?? (rl.line || "").length, (rl.line || "").length)),
+            ctx,
+            ghostSuffix: pendingGhostSuffix,
+            thinking: aiThinking ? THINK_FRAMES[thinkingFrame] : "",
+            selectedIndex: suggestionSelected,
+            modalLabel: modalPromptActive && fullscreenActive ? modalPromptLabel : "",
+          });
       const inputH = input.lines.length;
 
       const availableOutputH = Math.max(0, rows - inputH);
       const tail: string[] = [];
       const carry = outputCarry ? [outputCarry] : [];
       const all = outputLines.concat(carry);
-      const maxScroll = Math.max(0, all.length - availableOutputH);
+      const outputWidth = Math.max(1, cols - 1);
+      const visualLines = all.flatMap((line) => wrapAnsiLine(line, outputWidth));
+      const maxScroll = Math.max(0, visualLines.length - availableOutputH);
       scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
-      const start = Math.max(0, all.length - availableOutputH - scrollOffset);
-      for (const l of all.slice(start, start + availableOutputH)) {
-        tail.push(padAnsi(truncateAnsi(l, Math.max(0, cols - 1)), Math.max(0, cols - 1)));
+      const start = Math.max(0, visualLines.length - availableOutputH - scrollOffset);
+      for (const l of visualLines.slice(start, start + availableOutputH)) {
+        tail.push(padAnsi(truncateAnsi(l, outputWidth), outputWidth));
       }
       while (tail.length < availableOutputH) tail.unshift("");
 
-      rawStdoutWrite("\x1b[H\x1b[2J");
+      rawStdoutWrite("\x1b[?25l\x1b[H\x1b[2J");
       for (const l of tail) rawStdoutWrite(l + "\n");
       for (const l of input.lines) rawStdoutWrite(padAnsi(truncateAnsi(l, Math.max(0, cols - 1)), Math.max(0, cols - 1)) + "\n");
       // Terminal cursor stays hidden; we render a visible cursor in the input line.
@@ -319,6 +421,13 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   };
 
   const onMasterKeypress = async (str: string, key: { name?: string; ctrl?: boolean; shift?: boolean; sequence?: string }) => {
+    if (configScreen) {
+      if (await handleConfigKeypress(str, key, configScreen, ctx)) {
+        scheduleRender();
+        return;
+      }
+    }
+
     // While AI is responding, readline is paused. Keep input editable in fullscreen
     // by applying keypresses directly to `rl.line` so typed text doesn't end up elsewhere.
     if (fullscreenActive && aiThinking && !modalPromptActive) {
@@ -366,16 +475,18 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     if (!modalPromptActive && fullscreenActive && (key?.name === "pageup" || key?.name === "pagedown")) {
       const cols = process.stdout.columns || 96;
       const rows = (process.stdout as any).rows || 32;
-      const inputH = buildInputPanel({
-        cols,
-        mode: promptMode(),
-        line: String(rl.line || ""),
-        cursor: Math.max(0, Math.min((rl as any).cursor ?? (rl.line || "").length, (rl.line || "").length)),
-        ctx,
-        ghostSuffix: pendingGhostSuffix,
-        thinking: aiThinking ? THINK_FRAMES[thinkingFrame] : "",
-        selectedIndex: suggestionSelected,
-      }).lines.length;
+      const inputH = configWizardActive
+        ? 0
+        : buildInputPanel({
+            cols,
+            mode: promptMode(),
+            line: String(rl.line || ""),
+            cursor: Math.max(0, Math.min((rl as any).cursor ?? (rl.line || "").length, (rl.line || "").length)),
+            ctx,
+            ghostSuffix: pendingGhostSuffix,
+            thinking: aiThinking ? THINK_FRAMES[thinkingFrame] : "",
+            selectedIndex: suggestionSelected,
+          }).lines.length;
       const page = Math.max(1, rows - inputH - 1);
       if (key.name === "pageup") {
         scrollOffset = Math.min(outputLines.length, scrollOffset + page);
@@ -444,8 +555,52 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
 
   compositor.on("keypress", onMasterKeypress);
   compositor.on("data", (chunk: Buffer) => {
+    if (configScreen) {
+      return;
+    }
+    const chunkText = chunk.toString("utf8");
+    if (!modalPromptActive && !launchingInlineConfig && (chunkText === "\r" || chunkText === "\n" || chunkText === "\r\n")) {
+      const currentLine = String((rl as any).line || "").trim();
+      if (currentLine === "/config") {
+        launchingInlineConfig = true;
+        (rl as any).line = "";
+        (rl as any).cursor = 0;
+        void (async () => {
+          try {
+            await runConfigSession();
+          } finally {
+            launchingInlineConfig = false;
+            scheduleRender();
+          }
+        })();
+        scheduleRender();
+        return;
+      }
+    }
+    if ((rl as any).__forgeExternalPromptActive) {
+      return;
+    }
     if (modalPromptActive) {
+      if (fullscreenActive) {
+        const text = chunk.toString("utf8");
+        if (text === "\r" || text === "\n" || text === "\r\n") {
+          scheduleRender();
+        } else if (text === "\u007f") {
+          modalPromptBuffer = modalPromptBuffer.slice(0, -1);
+          scheduleRender();
+        } else if (/^[\x20-\x7e]$/.test(text)) {
+          modalPromptBuffer += text;
+          scheduleRender();
+        }
+      }
       rlInput.write(chunk);
+      return;
+    }
+
+    // During AI turns, the fullscreen UI applies edits directly to `rl.line`.
+    // Forwarding the same raw bytes into readline leaves queued input behind,
+    // especially after Escape/Ctrl+C aborts, which can wedge the next prompt.
+    if (aiThinking) {
       return;
     }
 
@@ -468,8 +623,9 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
 
     while (i < buf.length) {
       const ch = buf[i];
-      if (ch === 0x1b && i + 2 < buf.length && buf[i + 1] === 0x5b) {
-        // SGR: ESC[<
+      if (ch === 0x1b && i + 1 < buf.length && buf[i + 1] === 0x5b) {
+        if (i + 2 >= buf.length) break; // incomplete CSI
+        // SGR mouse: ESC[<b;x;yM or ESC[<b;x;ym
         if (buf[i + 2] === 0x3c) {
           let j = i + 3;
           while (j < buf.length && buf[j] !== 0x4d && buf[j] !== 0x6d) j++; // 'M' or 'm'
@@ -487,12 +643,17 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
           i = j + 1; // skip entire sequence
           continue;
         }
-        // X10: ESC[M + 3 bytes
+        // X10 mouse: ESC[M + 3 bytes
         if (buf[i + 2] === 0x4d) {
           if (i + 5 >= buf.length) break; // incomplete
           i += 6;
           continue;
         }
+        // Non-mouse CSI belongs to normal keyboard input (arrows, history,
+        // home/end, delete, etc.) and must still reach readline.
+        out.push(ch);
+        i++;
+        continue;
       }
 
       // Non-mouse byte: forward.
@@ -501,11 +662,14 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     }
 
     mouseCarry = i < buf.length ? buf.subarray(i) : null;
-    if (out.length) rlInput.write(Buffer.from(out));
+    if (out.length) {
+      rlInput.write(Buffer.from(out));
+      scheduleRender();
+    }
   });
 
   compositor.on("keypress", (_str: string, key: any) => {
-    if (!fullscreenActive || modalPromptActive) return;
+    if (!fullscreenActive || modalPromptActive || configScreen || (rl as any).__forgeExternalPromptActive) return;
     const line = String(rl.line || "");
     const trimmed = line.trimStart();
     if (!trimmed.startsWith("/")) return;
@@ -621,7 +785,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   }
 
   if (!ctx.state.onboardingComplete) {
-    await runConfigWizard(rl, ctx);
+    await runConfigSession();
   } else {
     await autoRefreshModels(ctx);
   }
@@ -655,7 +819,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
     lastSubmittedInput = input;
     lastSubmittedAt = now;
     if (await processInput(input)) {
-      if (process.stdout.isTTY) {
+      if (process.stdout.isTTY && !fullscreenActive) {
         process.stdout.write("\r\x1b[2K");
       }
       rl.pause();
@@ -666,7 +830,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
   async function processInput(input: string): Promise<boolean> {
     if (input.startsWith("/")) {
       try {
-        const shouldExit = await handleSlash(input, ctx, rl);
+        const shouldExit = await handleSlash(input, ctx, rl, { openConfig: runConfigSession });
         return shouldExit;
       } finally {
         scheduleRender();
@@ -707,7 +871,7 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       if (process.stdin.isTTY && process.stdin.isPaused()) {
         process.stdin.resume();
       }
-      if (process.stdout.isTTY) {
+      if (process.stdout.isTTY && !fullscreenActive) {
         process.stdout.write("\x1b[1A\r\x1b[2K");
       }
       // Save user message immediately so it survives long-running/aborted turns.
@@ -722,6 +886,13 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       compositor.enterThinking(() => {
         if (activeTurnAbort && !activeTurnAbort.signal.aborted) {
           activeTurnAbort.abort();
+          if (modalPromptActive) {
+            try {
+              rlInput.write("\n");
+            } catch {
+              // ignore prompt-cancel write failures
+            }
+          }
           if (activeSpinner) activeSpinner.stop();
           process.stdout.write("\n[stopping ai response...]\n");
           if (fullscreenActive) setThinking(false);
@@ -749,19 +920,36 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
           memoryContext: sessionMemoryDigest(ctx.sessionMemory),
           confirmAction: async (tool, args) => {
             if ((ctx.state.executionMode || "safe") === "yolo") return true;
+            if (!activeTurnAbort || activeTurnAbort.signal.aborted) return false;
             spinner.pause();
             modalPromptActive = true;
             (rl as any).__forgeModalPromptActive = true;
-            const ans = (await question(rl, `${C.yellow}confirm${C.reset} ${tool} ${JSON.stringify(args)} ? [y/N]: `))
-              .trim()
-              .toLowerCase();
-            modalPromptActive = false;
-            (rl as any).__forgeModalPromptActive = false;
-            if (process.stdout.isTTY) {
-              process.stdout.write("\r\x1b[2K");
+            preservedInputLine = String((rl as any).line || "");
+            preservedInputCursor = Math.max(0, Number((rl as any).cursor ?? preservedInputLine.length));
+            modalPromptLabel = "confirm";
+            modalPromptBuffer = "";
+            try {
+              const promptText = `${C.yellow}confirm${C.reset} ${tool} ${JSON.stringify(args)} ? [y/N]: `;
+              if (fullscreenActive) {
+                process.stdout.write(`${promptText}\n`);
+              }
+              const ans = (await question(rl, fullscreenActive ? "" : promptText, fullscreenActive ? { mute: true } : undefined))
+                .trim()
+                .toLowerCase();
+              if (!activeTurnAbort || activeTurnAbort.signal.aborted) return false;
+              return ans === "y" || ans === "yes";
+            } finally {
+              modalPromptActive = false;
+              (rl as any).__forgeModalPromptActive = false;
+               modalPromptLabel = "";
+               modalPromptBuffer = "";
+               (rl as any).line = preservedInputLine;
+               (rl as any).cursor = preservedInputCursor;
+              if (process.stdout.isTTY && !fullscreenActive) {
+                process.stdout.write("\r\x1b[2K");
+              }
+              spinner.resume();
             }
-            spinner.resume();
-            return ans === "y" || ans === "yes";
           },
           onStatus: (status) => spinner.setLabel(`ai ${status}`),
           onToolCall: (tool, args) => {
@@ -797,21 +985,36 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
             );
             modalPromptActive = true;
             (rl as any).__forgeModalPromptActive = true;
-            const answer = (await question(rl, `${C.yellow}wait>${C.reset} ${label} `)).trim();
-            modalPromptActive = false;
-            (rl as any).__forgeModalPromptActive = false;
-            if (process.stdout.isTTY) {
-              process.stdout.write("\r\x1b[2K");
+            preservedInputLine = String((rl as any).line || "");
+            preservedInputCursor = Math.max(0, Number((rl as any).cursor ?? preservedInputLine.length));
+            modalPromptLabel = "wait";
+            modalPromptBuffer = "";
+            try {
+              const waitPrompt = `${C.yellow}wait>${C.reset} ${label} `;
+              if (fullscreenActive) {
+                process.stdout.write(`${waitPrompt}\n`);
+              }
+              const answer = (await question(rl, fullscreenActive ? "" : waitPrompt, fullscreenActive ? { mute: true } : undefined)).trim();
+              if (/^(cancel|stop|abort)$/i.test(answer)) {
+                return `user did not complete manual step: ${reason}`;
+              }
+              return `user confirmed manual step completed: ${reason}`;
+            } finally {
+              modalPromptActive = false;
+              (rl as any).__forgeModalPromptActive = false;
+              modalPromptLabel = "";
+              modalPromptBuffer = "";
+              (rl as any).line = preservedInputLine;
+              (rl as any).cursor = preservedInputCursor;
+              if (process.stdout.isTTY && !fullscreenActive) {
+                process.stdout.write("\r\x1b[2K");
+              }
+              spinner.resume();
             }
-            spinner.resume();
-            if (/^(cancel|stop|abort)$/i.test(answer)) {
-              return `user did not complete manual step: ${reason}`;
-            }
-            return `user confirmed manual step completed: ${reason}`;
           }
         });
         spinner.stop();
-        process.stdout.write("\r\x1b[2K");
+        if (!fullscreenActive) process.stdout.write("\r\x1b[2K");
         if (response === "Stopped.") {
           process.stdout.write(`${C.yellow}ai stopped.${C.reset}\n`);
         } else {
@@ -832,7 +1035,13 @@ export async function runInteractiveChat(initialState: ForgeState, opts?: { resu
       console.error(`error> ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       activeTurnAbort = null;
-      rl.resume();
+      modalPromptActive = false;
+      (rl as any).__forgeModalPromptActive = false;
+      resetChatInputState();
+      if (fullscreenActive) {
+        renderScreen();
+      }
+      scheduleRender();
     }
     return false;
   }
@@ -1013,7 +1222,12 @@ function renderPlan(plan: { explanation?: string; steps: UiPlanStep[] }): void {
   }
 }
 
-async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interface): Promise<boolean> {
+async function handleSlash(
+  input: string,
+  ctx: ChatContext,
+  rl: readline.Interface,
+  actions?: { openConfig?: () => Promise<void> }
+): Promise<boolean> {
   const [cmd, ...args] = input.split(/\s+/);
 
   if (cmd === "/help") {
@@ -1064,7 +1278,11 @@ async function handleSlash(input: string, ctx: ChatContext, rl: readline.Interfa
   }
 
   if (cmd === "/config") {
-    await runConfigWizard(rl, ctx);
+    if (actions?.openConfig) {
+      await actions.openConfig();
+    } else {
+      console.log("config screen unavailable");
+    }
     return false;
   }
 
@@ -1765,18 +1983,19 @@ function buildHeaderPanel(state: ForgeState, cols: number, logoLines?: string[] 
 
 function buildInputPanel(args: {
   cols: number;
-  mode: "chat" | "shell";
+  mode: "chat" | "shell" | "modal";
   line: string;
   cursor: number;
   ghostSuffix: string;
   ctx: ChatContext;
   thinking: string;
   selectedIndex: number;
+  modalLabel?: string;
 }): { lines: string[] } {
   const cols = args.cols;
   const safeCols = Math.max(20, cols - 1); // never touch last col
   const innerWidth = Math.max(44, Math.min(120, safeCols - 4));
-  const label = args.mode === "shell" ? " shell " : " chat ";
+  const label = args.mode === "shell" ? " shell " : args.mode === "modal" ? ` ${args.modalLabel || "confirm"} ` : " chat ";
   const top = `${C.gray}┌─${C.reset}${C.white}${label}${C.reset}${C.gray}${"─".repeat(Math.max(0, innerWidth - (label.length + 2)))}┐${C.reset}`;
   const bottom = `${C.gray}└${"─".repeat(innerWidth)}┘${C.reset}`;
 
@@ -1856,6 +2075,81 @@ function buildInputPanel(args: {
     ...suggestionLines,
   ];
   return { lines };
+}
+
+function getConfigActions(): Array<{ key: ConfigActionKey; label: string }> {
+  return [
+    { key: "provider", label: "Provider" },
+    { key: "apikey", label: "API key" },
+    { key: "model", label: "Model" },
+    { key: "endpoint", label: "Endpoint" },
+    { key: "browserpath", label: "Browser path" },
+    { key: "searchmode", label: "Search mode" },
+    { key: "projectroot", label: "Project root" },
+    { key: "execmode", label: "Execution mode" },
+    { key: "save", label: "Save and exit" },
+    { key: "cancel", label: "Cancel" },
+  ];
+}
+
+function formatConfigValue(state: ForgeState, key: ConfigActionKey): string {
+  if (key === "provider") return state.provider.provider;
+  if (key === "apikey") return state.provider.provider === "ollama" ? "(not required)" : (state.apiKeys[state.provider.provider] ? "********" : "(not set)");
+  if (key === "model") return state.provider.model || "(empty)";
+  if (key === "endpoint") return state.provider.endpoint || (state.provider.provider === "ollama" ? "http://127.0.0.1:11434" : "(none)");
+  if (key === "browserpath") return state.browserExecutablePath || "(default playwright chromium)";
+  if (key === "searchmode") return state.searchMode || "safe";
+  if (key === "projectroot") return state.projectRoot;
+  if (key === "execmode") return state.executionMode || "safe";
+  return "";
+}
+
+function buildConfigPanel(cols: number, rows: number, screen: ConfigScreenState): string[] {
+  const safeCols = Math.max(20, cols - 1);
+  const panelW = Math.max(64, Math.min(108, safeCols - 4));
+  const leftPad = Math.max(0, Math.floor((safeCols - panelW) / 2));
+  const padLeft = (s: string) => `${" ".repeat(leftPad)}${s}`;
+  const actions = getConfigActions();
+  const lines: string[] = [];
+  lines.push("");
+  lines.push(padLeft(`${C.yellow}┌${"─".repeat(panelW)}┐${C.reset}`));
+  lines.push(padLeft(`${C.yellow}│${C.reset}${padAnsi(`${C.white} Forge Config ${C.reset}${C.gray}interactive setup${C.reset}`, panelW)}${C.yellow}│${C.reset}`));
+  lines.push(padLeft(`${C.yellow}├${"─".repeat(panelW)}┤${C.reset}`));
+
+  const labelW = 16;
+  const valueW = Math.max(10, panelW - labelW - 5);
+  for (let i = 0; i < actions.length; i++) {
+    const item = actions[i];
+    const selected = i === screen.selectedIndex;
+    const marker = selected ? `${C.cyan}>${C.reset}` : " ";
+    const value = formatConfigValue(screen.working, item.key);
+    const body = item.key === "save" || item.key === "cancel"
+      ? `${marker} ${item.label}`
+      : `${marker} ${padAnsi(truncateAnsi(item.label, labelW), labelW)} ${C.gray}${truncateAnsi(value, valueW)}${C.reset}`;
+    const row = selected ? `\x1b[7m${padAnsi(body, panelW)}\x1b[0m` : padAnsi(body, panelW);
+    lines.push(padLeft(`${C.yellow}│${C.reset}${row}${C.yellow}│${C.reset}`));
+  }
+
+  lines.push(padLeft(`${C.yellow}├${"─".repeat(panelW)}┤${C.reset}`));
+  if (screen.mode === "edit" && screen.editingField) {
+    const title = `Editing ${getConfigActions().find((item) => item.key === screen.editingField)?.label || screen.editingField}`;
+    const preview = screen.editingField === "apikey" ? "*".repeat(screen.editBuffer.length) : screen.editBuffer || " ";
+    lines.push(padLeft(`${C.yellow}│${C.reset}${padAnsi(`${C.white}${title}${C.reset}`, panelW)}${C.yellow}│${C.reset}`));
+    lines.push(padLeft(`${C.yellow}│${C.reset}${padAnsi(preview, panelW)}${C.yellow}│${C.reset}`));
+    lines.push(padLeft(`${C.yellow}│${C.reset}${padAnsi(`${C.gray}Enter saves this field. Esc cancels edit.${C.reset}`, panelW)}${C.yellow}│${C.reset}`));
+  } else {
+    lines.push(padLeft(`${C.yellow}│${C.reset}${padAnsi(`${C.gray}${screen.notice}${C.reset}`, panelW)}${C.yellow}│${C.reset}`));
+    lines.push(padLeft(`${C.yellow}│${C.reset}${padAnsi(`${C.gray}Left/Right cycles provider, search mode, and execution mode.${C.reset}`, panelW)}${C.yellow}│${C.reset}`));
+    lines.push(padLeft(`${C.yellow}│${C.reset}${padAnsi(`${C.gray}Enter edits text fields or activates save/cancel.${C.reset}`, panelW)}${C.yellow}│${C.reset}`));
+  }
+  lines.push(padLeft(`${C.yellow}└${"─".repeat(panelW)}┘${C.reset}`));
+
+  const out: string[] = [];
+  const topPad = Math.max(0, Math.floor((rows - lines.length) / 2));
+  for (let i = 0; i < topPad; i++) out.push("");
+  out.push(...lines);
+  while (out.length < rows) out.push("");
+  return out.slice(0, rows);
 }
 
 function clearRecentlyEchoedRows(rows: number): void {
@@ -1957,6 +2251,15 @@ function padAnsi(s: string, width: number): string {
   const len = stripAnsi(s).length;
   if (len >= width) return s;
   return s + " ".repeat(width - len);
+}
+
+function wrapAnsiLine(s: string, width: number): string[] {
+  if (width <= 0) return [""];
+  const plain = stripAnsi(s);
+  if (!plain.length) return [""];
+  const out: string[] = [];
+  for (let i = 0; i < plain.length; i += width) out.push(plain.slice(i, i + width));
+  return out;
 }
 
 async function tryRenderForgeSvgAscii(targetW: number, targetH: number): Promise<string[] | null> {
@@ -2288,309 +2591,160 @@ function getGoogleUserId(): string {
   );
 }
 
-async function runConfigWizard(rl: readline.Interface, ctx: ChatContext): Promise<void> {
-  const enquirer = await loadEnquirer();
-  if (!enquirer) {
-    console.log("enquirer not available, using fallback config menu.");
-    await runConfigWizardFallback(rl, ctx);
-    return;
+async function handleConfigKeypress(
+  str: string,
+  key: { name?: string; ctrl?: boolean; shift?: boolean; sequence?: string },
+  screen: ConfigScreenState,
+  ctx: ChatContext
+): Promise<boolean> {
+  const actions = getConfigActions();
+  const current = actions[screen.selectedIndex]?.key || "provider";
+
+  if (screen.mode === "edit" && screen.editingField) {
+    if (key?.name === "escape") {
+      screen.mode = "nav";
+      screen.editingField = undefined;
+      screen.editBuffer = "";
+      screen.notice = "Edit canceled.";
+      return true;
+    }
+    if (key?.name === "return" || key?.name === "enter") {
+      commitConfigEdit(screen);
+      screen.notice = "Field updated.";
+      return true;
+    }
+    if (key?.name === "backspace") {
+      screen.editBuffer = screen.editBuffer.slice(0, -1);
+      return true;
+    }
+    if (key?.ctrl && key?.name === "u") {
+      screen.editBuffer = "";
+      return true;
+    }
+    if (typeof str === "string" && str.length === 1 && !key?.ctrl) {
+      screen.editBuffer += str;
+      return true;
+    }
+    return true;
   }
 
-  console.log("Config menu (Enquirer): arrow keys to select, Enter to edit.");
-  let working = { ...ctx.state };
-
-  while (true) {
-    const pick = await enqSelect(rl, enquirer, "Config", [
-      { name: "provider", message: `Provider        : ${working.provider.provider}` },
-      { name: "apikey", message: `API key         : ${working.provider.provider === "ollama" ? "(not required)" : "(set/update)"}` },
-      { name: "model", message: `Model           : ${working.provider.model}` },
-      {
-        name: "endpoint",
-        message: `Endpoint        : ${working.provider.endpoint || (working.provider.provider === "ollama" ? "http://127.0.0.1:11434" : "(none)")}`
-      },
-      { name: "browserpath", message: `Browser path    : ${working.browserExecutablePath || "(default playwright chromium)"}` },
-      { name: "searchmode", message: `Search mode     : ${working.searchMode || "safe"}` },
-      { name: "projectroot", message: `Project root    : ${working.projectRoot}` },
-      { name: "execmode", message: `Execution mode  : ${working.executionMode || "safe"}` },
-      { name: "save", message: "Save and exit" },
-      { name: "cancel", message: "Cancel" }
-    ]);
-
-    if (pick === "cancel") {
-      console.log("Config canceled.");
-      return;
+  if (key?.name === "up") {
+    screen.selectedIndex = Math.max(0, screen.selectedIndex - 1);
+    return true;
+  }
+  if (key?.name === "down") {
+    screen.selectedIndex = Math.min(actions.length - 1, screen.selectedIndex + 1);
+    return true;
+  }
+  if (key?.name === "escape") {
+    screen.notice = "Config canceled.";
+    screen.resolver();
+    return true;
+  }
+  if (key?.name === "left" || key?.name === "right") {
+    const dir = key.name === "right" ? 1 : -1;
+    if (current === "provider") {
+      const idx = PROVIDERS.indexOf(screen.working.provider.provider);
+      const next = PROVIDERS[(idx + dir + PROVIDERS.length) % PROVIDERS.length];
+      await applyConfigProviderChange(screen, ctx, next);
+      return true;
     }
-    if (pick === "save") {
-      working = { ...working, onboardingComplete: true };
-      ctx.state = working;
-      await saveState(ctx.state);
-      if (ctx.state.projectRoot !== ctx.workspace.projectRoot) {
-        ctx.workspace = await loadWorkspace(ctx.state.projectRoot);
-      }
-      await autoRefreshModels(ctx);
-      console.log("Config saved.");
-      return;
+    if (current === "searchmode") {
+      const options = ["safe", "manual"] as const;
+      const idx = options.indexOf((screen.working.searchMode || "safe") as "safe" | "manual");
+      screen.working = { ...screen.working, searchMode: options[(idx + dir + options.length) % options.length] };
+      screen.notice = `Search mode set to ${screen.working.searchMode}.`;
+      return true;
     }
-
-    if (pick === "provider") {
-      const providerInput = await enqSelect(rl, enquirer, "Provider", PROVIDERS.map((p) => ({ name: p, message: p })), working.provider.provider);
-      if (providerInput && PROVIDERS.includes(providerInput as ProviderKind)) {
-        working = setProvider(working, { ...working.provider, provider: providerInput as ProviderKind });
-        try {
-          const models = await fetchModels(working, working.provider.provider);
-          ctx.modelSuggestions = models;
-          if (models.length && !models.includes(working.provider.model)) {
-            working = setProvider(working, { ...working.provider, model: models[0] });
-          }
-        } catch {
-          // Keep current model if refresh fails.
-        }
-      }
-      continue;
-    }
-
-    if (pick === "model") {
-      if (!ctx.modelSuggestions.length) {
-        try {
-          ctx.modelSuggestions = await fetchModels(working, working.provider.provider);
-        } catch {
-          // allow manual entry
-        }
-      }
-      const current = working.provider.model;
-      let modelInput = "";
-      if (ctx.modelSuggestions.length) {
-        const top = ctx.modelSuggestions.slice(0, 50);
-        modelInput = await enqSelect(
-          rl,
-          enquirer,
-          "Model (Top cached)",
-          [...top.map((m) => ({ name: m, message: m })), { name: "__manual__", message: "Manual model id..." }],
-          current
-        );
-        if (modelInput === "__manual__") {
-          modelInput = await enqInput(rl, enquirer, "Model id", current);
-        }
-      } else {
-        modelInput = await enqInput(rl, enquirer, "Model id", current);
-      }
-      if (modelInput) {
-        working = setProvider(working, { ...working.provider, model: modelInput });
-      }
-      continue;
-    }
-
-    if (pick === "apikey") {
-      if (working.provider.provider === "ollama") {
-        console.log("Ollama selected: API key not required.");
-        continue;
-      }
-      const keyInput = await enqPassword(rl, enquirer, `API key for ${working.provider.provider}`);
-      if (keyInput) working = setApiKeyInConfig(working, working.provider.provider, keyInput);
-      continue;
-    }
-
-    if (pick === "endpoint") {
-      const endpointInput = await enqInput(
-        rl,
-        enquirer,
-        "Endpoint",
-        working.provider.endpoint || (working.provider.provider === "ollama" ? "http://127.0.0.1:11434" : "")
-      );
-      if (endpointInput) working = setProvider(working, { ...working.provider, endpoint: endpointInput });
-      continue;
-    }
-
-    if (pick === "browserpath") {
-      const browserPathInput = await enqInput(
-        rl,
-        enquirer,
-        "Browser executable path",
-        working.browserExecutablePath || ""
-      );
-      if (browserPathInput) working = { ...working, browserExecutablePath: browserPathInput };
-      continue;
-    }
-
-    if (pick === "searchmode") {
-      const searchModeInput = await enqSelect(
-        rl,
-        enquirer,
-        "Search mode",
-        [{ name: "safe", message: "safe" }, { name: "manual", message: "manual" }],
-        working.searchMode || "safe"
-      );
-      if (searchModeInput === "safe" || searchModeInput === "manual") working = { ...working, searchMode: searchModeInput };
-      continue;
-    }
-
-    if (pick === "projectroot") {
-      const rootInput = await enqInput(rl, enquirer, "Project root", working.projectRoot);
-      if (rootInput) working = { ...working, projectRoot: rootInput };
-      continue;
-    }
-
-    if (pick === "execmode") {
-      const modeInput = await enqSelect(
-        rl,
-        enquirer,
-        "Execution mode",
-        [{ name: "safe", message: "safe" }, { name: "yolo", message: "yolo" }],
-        working.executionMode || "safe"
-      );
-      if (modeInput === "safe" || modeInput === "yolo") working = { ...working, executionMode: modeInput };
-      continue;
+    if (current === "execmode") {
+      const options = ["safe", "yolo"] as const;
+      const idx = options.indexOf((screen.working.executionMode || "safe") as "safe" | "yolo");
+      screen.working = { ...screen.working, executionMode: options[(idx + dir + options.length) % options.length] };
+      screen.notice = `Execution mode set to ${screen.working.executionMode}.`;
+      return true;
     }
   }
+  if (key?.name === "return" || key?.name === "enter") {
+    if (current === "save") {
+      await saveConfigScreen(screen, ctx);
+      screen.notice = "Config saved.";
+      screen.resolver();
+      return true;
+    }
+    if (current === "cancel") {
+      screen.notice = "Config canceled.";
+      screen.resolver();
+      return true;
+    }
+    if (current === "provider" || current === "searchmode" || current === "execmode") {
+      return await handleConfigKeypress("", { name: "right" }, screen, ctx);
+    }
+    startConfigEdit(screen, current);
+    return true;
+  }
+  return true;
 }
 
-async function runConfigWizardFallback(rl: readline.Interface, ctx: ChatContext): Promise<void> {
-  console.log("Config menu: choose field number, then edit. Enter `s` to save, `q` to cancel.");
-  let working = { ...ctx.state };
-
-  while (true) {
-    console.log([
-      "",
-      `1) Provider        : ${working.provider.provider}`,
-      `2) API key         : ${working.provider.provider === "ollama" ? "(not required)" : "(set/update)"}`,
-      `3) Model           : ${working.provider.model}`,
-      `4) Endpoint        : ${working.provider.endpoint || (working.provider.provider === "ollama" ? "http://127.0.0.1:11434" : "(none)")}`,
-      `5) Browser path    : ${working.browserExecutablePath || "(default playwright chromium)"}`,
-      `6) Search mode     : ${working.searchMode || "safe"}`,
-      `7) Project root    : ${working.projectRoot}`,
-      `8) Execution mode  : ${working.executionMode || "safe"}`,
-      "s) Save and exit",
-      "q) Cancel"
-    ].join("\n"));
-
-    const pick = (await question(rl, "config> ")).trim().toLowerCase();
-    if (pick === "q") return;
-    if (pick === "s") {
-      working = { ...working, onboardingComplete: true };
-      ctx.state = working;
-      await saveState(ctx.state);
-      if (ctx.state.projectRoot !== ctx.workspace.projectRoot) {
-        ctx.workspace = await loadWorkspace(ctx.state.projectRoot);
-      }
-      await autoRefreshModels(ctx);
-      console.log("Config saved.");
-      return;
-    }
-    if (pick === "1") {
-      const providerInput = (await question(rl, `Provider [${PROVIDERS.join(", ")}] (${working.provider.provider}): `)).trim();
-      if (providerInput && PROVIDERS.includes(providerInput as ProviderKind)) {
-        working = setProvider(working, { ...working.provider, provider: providerInput as ProviderKind });
-      }
-      continue;
-    }
-    if (pick === "2") {
-      if (working.provider.provider === "ollama") continue;
-      const keyInput = (await question(rl, `API key for ${working.provider.provider}: `)).trim();
-      if (keyInput) working = setApiKeyInConfig(working, working.provider.provider, keyInput);
-      continue;
-    }
-    if (pick === "3") {
-      const modelInput = (await question(rl, `Model (${working.provider.model}): `)).trim();
-      if (modelInput) working = setProvider(working, { ...working.provider, model: modelInput });
-      continue;
-    }
-    if (pick === "4") {
-      const endpointInput = (await question(rl, "Endpoint: ")).trim();
-      if (endpointInput) working = setProvider(working, { ...working.provider, endpoint: endpointInput });
-      continue;
-    }
-    if (pick === "5") {
-      const browserPathInput = (await question(rl, "Browser executable path: ")).trim();
-      if (browserPathInput) working = { ...working, browserExecutablePath: browserPathInput };
-      continue;
-    }
-    if (pick === "6") {
-      const searchModeInput = (await question(rl, "Search mode [safe/manual]: ")).trim().toLowerCase();
-      if (searchModeInput === "safe" || searchModeInput === "manual") working = { ...working, searchMode: searchModeInput };
-      continue;
-    }
-    if (pick === "7") {
-      const rootInput = (await question(rl, `Project root (${working.projectRoot}): `)).trim();
-      if (rootInput) working = { ...working, projectRoot: rootInput };
-      continue;
-    }
-    if (pick === "8") {
-      const modeInput = (await question(rl, "Execution mode [safe/yolo]: ")).trim().toLowerCase();
-      if (modeInput === "safe" || modeInput === "yolo") working = { ...working, executionMode: modeInput };
-    }
-  }
+function startConfigEdit(screen: ConfigScreenState, field: ConfigFieldKey): void {
+  screen.mode = "edit";
+  screen.editingField = field;
+  if (field === "apikey") screen.editBuffer = "";
+  else if (field === "model") screen.editBuffer = screen.working.provider.model || "";
+  else if (field === "endpoint") screen.editBuffer = screen.working.provider.endpoint || "";
+  else if (field === "browserpath") screen.editBuffer = screen.working.browserExecutablePath || "";
+  else if (field === "projectroot") screen.editBuffer = screen.working.projectRoot || "";
 }
 
-type EnquirerModule = {
-  prompt: (question: Record<string, unknown>) => Promise<Record<string, string>>;
-};
+function commitConfigEdit(screen: ConfigScreenState): void {
+  const field = screen.editingField;
+  const value = screen.editBuffer.trim();
+  if (!field) return;
+  if (field === "apikey") {
+    if (screen.working.provider.provider !== "ollama" && value) {
+      screen.working = setApiKeyInConfig(screen.working, screen.working.provider.provider, value);
+    }
+  } else if (field === "model" && value) {
+    screen.working = setProvider(screen.working, { ...screen.working.provider, model: value });
+  } else if (field === "endpoint") {
+    screen.working = setProvider(screen.working, { ...screen.working.provider, endpoint: value || undefined });
+  } else if (field === "browserpath") {
+    screen.working = { ...screen.working, browserExecutablePath: value || undefined };
+  } else if (field === "projectroot" && value) {
+    screen.working = { ...screen.working, projectRoot: value };
+  }
+  screen.mode = "nav";
+  screen.editingField = undefined;
+  screen.editBuffer = "";
+}
 
-async function loadEnquirer(): Promise<EnquirerModule | null> {
+async function saveConfigScreen(screen: ConfigScreenState, ctx: ChatContext): Promise<void> {
+  const nextState = { ...screen.working, onboardingComplete: true };
+  ctx.state = nextState;
+  await saveState(ctx.state);
+  if (ctx.state.projectRoot !== ctx.workspace.projectRoot) {
+    ctx.workspace = await loadWorkspace(ctx.state.projectRoot);
+  }
+  await autoRefreshModels(ctx);
+}
+
+async function applyConfigProviderChange(
+  screen: ConfigScreenState,
+  ctx: ChatContext,
+  provider: ProviderKind
+): Promise<void> {
+  screen.working = setProvider(screen.working, { ...screen.working.provider, provider });
   try {
-    const mod = await import("enquirer");
-    const anyMod = mod as any;
-    const promptFn =
-      (typeof anyMod?.prompt === "function" && anyMod.prompt) ||
-      (typeof anyMod?.default?.prompt === "function" && anyMod.default.prompt) ||
-      (typeof anyMod?.default === "function" && typeof anyMod.default.prompt === "function" && anyMod.default.prompt) ||
-      null;
-    if (!promptFn) return null;
-    return { prompt: promptFn as EnquirerModule["prompt"] };
-  } catch {
-    return null;
-  }
-}
-
-async function enqSelect(
-  rl: readline.Interface,
-  enquirer: EnquirerModule,
-  message: string,
-  choices: Array<{ name: string; message: string }>,
-  initial?: string
-): Promise<string> {
-  const initialIndex = typeof initial === "string" ? Math.max(0, choices.findIndex((c) => c.name === initial)) : 0;
-  const out = await withRlPaused(rl, async () => {
-    const ans = await enquirer.prompt({
-      type: "select",
-      name: "value",
-      message,
-      choices,
-      initial: initialIndex
-    });
-    return String(ans.value || "");
-  });
-  return out;
-}
-
-async function enqInput(rl: readline.Interface, enquirer: EnquirerModule, message: string, initial = ""): Promise<string> {
-  return await withRlPaused(rl, async () => {
-    const ans = await enquirer.prompt({
-      type: "input",
-      name: "value",
-      message,
-      initial
-    });
-    return String(ans.value || "").trim();
-  });
-}
-
-async function enqPassword(rl: readline.Interface, enquirer: EnquirerModule, message: string): Promise<string> {
-  return await withRlPaused(rl, async () => {
-    const ans = await enquirer.prompt({
-      type: "password",
-      name: "value",
-      message
-    });
-    return String(ans.value || "").trim();
-  });
-}
-
-async function withRlPaused<T>(rl: readline.Interface, fn: () => Promise<T>): Promise<T> {
-  rl.pause();
-  try {
-    return await fn();
-  } finally {
-    rl.resume();
+    const models = await fetchModels(screen.working, provider);
+    ctx.modelSuggestions = models;
+    if (models.length && !models.includes(screen.working.provider.model)) {
+      screen.working = setProvider(screen.working, { ...screen.working.provider, model: models[0] });
+      screen.notice = `Provider set to ${provider}. Model auto-selected: ${models[0]}.`;
+      return;
+    }
+    screen.notice = `Provider set to ${provider}.`;
+  } catch (err) {
+    ctx.modelSuggestions = [];
+    screen.notice = `Provider set to ${provider}. Models refresh skipped: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 

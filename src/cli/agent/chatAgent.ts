@@ -219,6 +219,8 @@ export async function runAiTurn(
 
   let context = `${system}\n\nUser: ${userInput}\n`;
   let stepsSinceFollowUp = 0;
+  let consecutivePlanUpdates = 0;
+  let lastPlanFingerprint = "";
   const pendingSkillReads = new Set<string>();
   const shouldReadDesignSkills = /\b(design|redesign|ui|ux|website|landing\s*page|css|layout|typography|brand)\b/i.test(userInput);
   if (shouldReadDesignSkills && globalSkillFiles.length) {
@@ -306,15 +308,28 @@ export async function runAiTurn(
         context += "\nTool result: plans.update rejected (invalid steps). Provide non-empty steps with statuses pending|in_progress|completed.\n";
         continue;
       }
+      const fingerprint = JSON.stringify(plan);
+      consecutivePlanUpdates++;
+      const isDuplicate = fingerprint === lastPlanFingerprint;
+      lastPlanFingerprint = fingerprint;
       if (!signal?.aborted) opts?.onToolCall?.(parsed.tool, parsed.args || {});
       if (!signal?.aborted) opts?.onPlanUpdate?.(plan);
       if (!signal?.aborted) opts?.onToolResult?.(parsed.tool, `updated ${plan.steps.length} steps`);
       context += `\nTool call ${i + 1}: ${JSON.stringify(parsed)}\nTool result ${i + 1}: plan updated (${plan.steps.length} steps)\n`;
+      if (isDuplicate || consecutivePlanUpdates >= 2) {
+        context += "\nPlanner note: stop replanning. Your next reply MUST be either a non-plan tool call that executes the next step, or finish_response if the task is already complete.\n";
+      } else {
+        context += "\nPlanner note: plan captured. Now execute the next step instead of sending another plans.update.\n";
+      }
       continue;
     }
 
+    consecutivePlanUpdates = 0;
+
     if ((state.executionMode || "safe") !== "yolo" && opts?.confirmAction) {
+      throwIfAborted();
       const ok = await opts.confirmAction(parsed.tool, parsed.args || {});
+      throwIfAborted();
       if (!ok) {
         const denial = `action denied by user: ${parsed.tool}`;
         if (!signal?.aborted) opts?.onToolResult?.(parsed.tool, denial);

@@ -77,6 +77,9 @@ export class TerminalCompositor extends EventEmitter {
     this.sigintHandler = () => {
       if (this._thinking && this.activeAbort) {
         this.activeAbort();
+      } else if ((this.rl as any)?.__forgeExternalPromptActive || (this.rl as any)?.__forgeModalPromptActive) {
+        // Let active prompt UIs handle Ctrl+C/cancel without exiting Forge.
+        return;
       } else {
         this.reset();
         process.exit(0);
@@ -108,6 +111,21 @@ export class TerminalCompositor extends EventEmitter {
   public exitThinking() {
     this._thinking = false;
     this.activeAbort = null;
+    if (process.stdin.isTTY) {
+      try {
+        process.stdin.setRawMode(true);
+        this.isRaw = true;
+      } catch {
+        // ignore terminal restoration failures
+      }
+      if (process.stdin.isPaused()) {
+        try {
+          process.stdin.resume();
+        } catch {
+          // ignore
+        }
+      }
+    }
     if (this.rl) {
       this.rl.resume();
     }

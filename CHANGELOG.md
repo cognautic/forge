@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.16 - 2026-04-05
+- Replaced the old config prompt flow with a Forge-native interactive config screen inside the fullscreen chat UI:
+  - arrow-key selectable rows for provider, model, API key, endpoint, browser path, search mode, project root, and execution mode
+  - inline field editing with Enter to edit/save and Esc to cancel
+  - save/cancel actions handled inside Forge without external prompt handoff
+- Fixed `/config` and onboarding config stability issues:
+  - opening config no longer drops back to the shell prompt
+  - first-run config now renders immediately instead of only appearing after scroll/redraw
+  - config close/cancel now restores the chat screen cleanly without stale prompt frames or duplicated cursor state
+
 ## 0.0.15 - 2026-03-18
 - Rebuilt interactive chat UI as a true fullscreen compositor (alternate screen buffer):
   - fixed header rendered into scrollback so output pushes it away naturally

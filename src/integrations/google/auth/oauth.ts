@@ -10,6 +10,8 @@ const DEFAULT_CONVEX_GOOGLE_EXCHANGE_URL = "https://limitless-eel-242.convex.sit
 const DEFAULT_CONVEX_GOOGLE_LOGOUT_URL = "https://limitless-eel-242.convex.site/google/logout";
 const DEFAULT_CONVEX_GOOGLE_REFRESH_URL = "https://limitless-eel-242.convex.site/google/refresh";
 
+const clientCache = new Map<string, OAuth2Client>();
+
 function requiredEnv(name: "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET"): string {
   const value = process.env[name];
   if (!value) throw new Error(`${name} is required`);
@@ -53,11 +55,18 @@ export async function exchangeCode(code: string, redirectUri: string): Promise<C
  */
 export async function getAuthenticatedClient(userId: string): Promise<OAuth2Client | null> {
   const stored = await loadTokens(userId);
-  if (!stored) return null;
+  if (!stored) {
+    clientCache.delete(userId);
+    return null;
+  }
   const redirectUri = getRedirectUri(Number(process.env.GOOGLE_REDIRECT_PORT || 3747));
-  const client = createRuntimeOAuthClient(redirectUri);
+  const client = clientCache.get(userId) || createRuntimeOAuthClient(redirectUri);
   const nextTokens = await ensureFreshTokens(stored.tokens);
+  if (tokensChanged(stored.tokens, nextTokens)) {
+    await saveTokens(userId, nextTokens, stored.grantedScopes);
+  }
   client.setCredentials(nextTokens);
+  client.removeAllListeners("tokens");
   client.on("tokens", async (tokens) => {
     const merged = {
       ...nextTokens,
@@ -66,6 +75,7 @@ export async function getAuthenticatedClient(userId: string): Promise<OAuth2Clie
     };
     await saveTokens(userId, merged, stored.grantedScopes);
   });
+  clientCache.set(userId, client);
   return client;
 }
 
@@ -133,6 +143,7 @@ export async function connectGoogle(
       refresh_token: exchanged.tokens.refresh_token || latestStored?.tokens.refresh_token
     };
     await saveTokens(userId, merged, grantedScopes);
+    clientCache.delete(userId);
     return { success: true, email: me || "unknown" };
   } catch (error) {
     return { success: false, error: formatError(error) };
@@ -162,6 +173,7 @@ export async function disconnectGoogle(userId: string): Promise<{ success: true 
 
   try {
     await deleteTokens(userId);
+    clientCache.delete(userId);
     if (remoteError) {
       return { success: false, error: `Local tokens deleted, but remote logout failed: ${remoteError}` };
     }
@@ -223,6 +235,10 @@ async function exchangeCodeLocally(
   const oauth2 = google.oauth2({ auth: client, version: "v2" });
   const me = await oauth2.userinfo.get();
   return { tokens, email: me.data.email || "unknown" };
+}
+
+function tokensChanged(a: Credentials, b: Credentials): boolean {
+  return JSON.stringify(a || {}) !== JSON.stringify(b || {});
 }
 
 async function exchangeCodeViaServer(
